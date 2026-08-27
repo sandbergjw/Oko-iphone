@@ -5,15 +5,6 @@ create table if not exists public.receipt_items (
   store text,
   created_at timestamptz not null default now()
 );
-
 alter table public.receipt_items enable row level security;
-
-create policy "allow anon insert"
-on public.receipt_items for insert
-to anon
-with check (true);
-
-create policy "allow anon select"
-on public.receipt_items for select
-to anon
-using (true);
+create policy "allow anon insert" on public.receipt_items for insert to anon with check (true);
+create policy "allow anon select" on public.receipt_items for select to anon using (true);
