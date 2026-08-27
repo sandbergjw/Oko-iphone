@@ -1,62 +1,107 @@
 import streamlit as st
 import pandas as pd
+from PIL import Image
 
 st.set_page_config(page_title="Øko-robot",page_icon="🥬",layout="centered")
 st.title("🥬 Øko-robot")
-st.caption("v0.8 · personlige øko-tilbud")
+st.caption("v0.9 · tilbudsmatch + boner fra Fotos")
 
-if "vaner" not in st.session_state:
-    st.session_state.vaner={}
+OFFERS = pd.DataFrame([
+["Netto","Økologisk letmælk 1 L",14.95],
+["REMA 1000","Økologisk letmælk 1 L",13.95],
+["365discount","Økologisk letmælk 1 L",12.95],
+["føtex","Økologisk letmælk 1 L",15.95],
+["Nemlig.com","Økologisk letmælk 1 L",13.50],
+["Netto","Økologiske æg 10 stk",29.95],
+["REMA 1000","Økologiske æg 10 stk",27.95],
+["365discount","Økologiske æg 10 stk",24.95],
+["føtex","Økologiske æg 10 stk",29.95],
+["Nemlig.com","Økologiske æg 10 stk",28.00],
+["Netto","Økologiske bananer",18.95],
+["REMA 1000","Økologiske bananer",14.95],
+["365discount","Økologiske bananer",16.95],
+["føtex","Økologiske bananer",19.95],
+["Nemlig.com","Økologiske bananer",17.95],
+["Netto","Økologisk hakket oksekød 8-12%",55.00],
+["REMA 1000","Økologisk hakket oksekød 8-12%",59.95],
+["365discount","Økologisk hakket oksekød 8-12%",57.00],
+["føtex","Økologisk pasta 500 g",18.00],
+["Nemlig.com","Økologisk pasta 500 g",16.95],
+], columns=["Butik","Vare","Pris"])
 
-offers=pd.DataFrame([
-["Netto","Letmælk",14.95],["REMA 1000","Letmælk",13.95],["365discount","Letmælk",12.95],
-["føtex","Letmælk",15.95],["Nemlig.com","Letmælk",13.50],
-["Netto","Æg 10 stk",29.95],["REMA 1000","Æg 10 stk",27.95],["365discount","Æg 10 stk",24.95],
-["Netto","Bananer",18.95],["REMA 1000","Bananer",14.95],["365discount","Bananer",16.95],
-],columns=["Butik","Vare","Pris"])
+ALIASES = {
+    "mælk":["mælk","letmælk","sødmælk","minimælk"],
+    "æg":["æg"],
+    "banan":["banan","bananer"],
+    "hakket kød":["hakket oksekød","hakket kød","oksekød"],
+    "hakket oksekød":["hakket oksekød","oksekød"],
+    "pasta":["pasta","spaghetti","penne","fusilli"],
+}
 
-def norm(x): return str(x).lower().replace("øko ","").replace("økologisk ","").strip()
-def score(a,b):
-    A=set(norm(a).split()); B=set(norm(b).split())
-    return len(A&B)/len(A|B) if A and B else 0
+def norm(s):
+    return str(s).lower().strip()
 
-home,personal,listtab,receipt=st.tabs(["🏠","🎯","🛒","📸"])
+def matches(query, product):
+    q=norm(query)
+    p=norm(product)
+    if q in p:
+        return True
+    for key, aliases in ALIASES.items():
+        if q == key or q in aliases:
+            return any(a in p for a in aliases)
+    words=[w for w in q.split() if len(w)>2]
+    return bool(words) and all(w in p for w in words)
+
+def find_matches(items):
+    rows=[]
+    for item in items:
+        m=OFFERS[OFFERS["Vare"].apply(lambda x: matches(item,x))]
+        if m.empty:
+            rows.append([item,"Ikke fundet","",None])
+        else:
+            r=m.sort_values("Pris").iloc[0]
+            rows.append([item,r["Butik"],r["Vare"],float(r["Pris"])])
+    return pd.DataFrame(rows,columns=["Du mangler","Bedste butik","Matchet tilbud","Pris"])
+
+home,need,deals,receipt = st.tabs(["🏠","📝 Jeg mangler","🔥 Tilbud","📸 Bon"])
 
 with home:
-    st.success("Din personlige øko-indkøbshjælper")
-    st.write("Nyt: Robotten kan matche dine faste varer med ugens øko-tilbud.")
-    st.metric("Lærte varer",len(st.session_state.vaner))
+    st.success("Din økologiske indkøbshjælper")
+    st.write("Skriv hvad du mangler, så matcher robotten det med relevante tilbud.")
+    st.info("Priserne i denne prototype er stadig testdata.")
 
-with personal:
-    st.subheader("Tilbud til dig")
-    if not st.session_state.vaner:
-        st.info("Tilføj nogle varer under 📸 Bon først.")
-    else:
-        rows=[]
-        for item,n in st.session_state.vaner.items():
-            candidates=[]
-            for _,r in offers.iterrows():
-                s=score(item,r["Vare"])
-                if s>=0.35:candidates.append((s,r))
-            if candidates:
-                _,r=max(candidates,key=lambda x:(x[0],-x[1]["Pris"]))
-                rows.append([item,n,r["Butik"],r["Vare"],r["Pris"]])
-        if rows:
-            st.dataframe(pd.DataFrame(rows,columns=["Din vare","Køb","Butik","Tilbud","Pris"]),hide_index=True,use_container_width=True)
-        else: st.info("Ingen match endnu.")
+with need:
+    st.subheader("Hvad mangler du?")
+    txt=st.text_area(
+        "Skriv én varetype pr. linje",
+        "mælk\næg\npasta\nhakket kød",
+        height=180
+    )
+    items=[x.strip() for x in txt.splitlines() if x.strip()]
+    if st.button("Match med tilbud",type="primary"):
+        result=find_matches(items)
+        st.dataframe(result,hide_index=True,use_container_width=True)
+        total=result["Pris"].fillna(0).sum()
+        if total:
+            st.metric("Pris for fundne tilbud",f"{total:.2f} kr.")
+        missing=result[result["Bedste butik"]=="Ikke fundet"]
+        if not missing.empty:
+            st.warning("Nogle varetyper havde ikke et match i de aktuelle data.")
 
-with listtab:
-    default="\n".join(x[0] for x in sorted(st.session_state.vaner.items(),key=lambda x:x[1],reverse=True)[:6])
-    st.text_area("Min indkøbsliste",default or "Letmælk\nÆg 10 stk\nBananer",height=180)
+with deals:
+    st.subheader("Øko-tilbud")
+    st.dataframe(OFFERS.sort_values(["Vare","Pris"]),hide_index=True,use_container_width=True)
 
 with receipt:
-    st.subheader("Lær fra en bon")
-    st.camera_input("Tag billede af bonen")
-    txt=st.text_area("Indtast/indsæt varelinjer – én pr. linje",height=180)
-    if st.button("Gem og lær",type="primary"):
-        for x in [x.strip() for x in txt.splitlines() if x.strip()]:
-            k=norm(x); st.session_state.vaner[k]=st.session_state.vaner.get(k,0)+1
-        st.success("Varerne er lært i denne session.")
-        st.rerun()
+    st.subheader("Bon")
+    camera=st.camera_input("📷 Tag billede af bon")
+    upload=st.file_uploader(
+        "🖼️ Vælg bon fra Fotos",
+        type=["jpg","jpeg","png","webp"]
+    )
+    source=camera or upload
+    if source:
+        st.image(Image.open(source),caption="Valgt bon",use_container_width=True)
+        st.success("Bonen er klar til aflæsning i OCR-versionen.")
 
-st.caption("v0.8 · denne kompakte build bevarer fokus på personlig tilbudsmatching")
+st.caption("Øko-robot v0.9")
