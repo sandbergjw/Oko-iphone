@@ -1,0 +1,19 @@
+create table if not exists public.receipt_items (
+  id uuid primary key,
+  item text not null,
+  normalized_item text not null,
+  store text,
+  created_at timestamptz not null default now()
+);
+
+alter table public.receipt_items enable row level security;
+
+create policy "allow anon insert"
+on public.receipt_items for insert
+to anon
+with check (true);
+
+create policy "allow anon select"
+on public.receipt_items for select
+to anon
+using (true);
