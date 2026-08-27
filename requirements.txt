@@ -1,0 +1,1 @@
+streamlit>=1.40\npandas>=2.2\npillow>=10.0\n
