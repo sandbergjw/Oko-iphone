@@ -60,10 +60,10 @@ def normalize(text):
 
 
 def looks_organic(text):
-    t = str(text).lower()
+    t = str(text).lower().strip()
     return any(x in t for x in [
         "økolog", " øko", "øgo", "änglamark", "salling øko", "365 øko"
-    ])
+    ]) or bool(re.match(r"^o\s+[a-zæøå]", t))
 
 
 def money(text):
@@ -381,19 +381,35 @@ def wishlist_match(data, items, organic_only=True):
                 "Pris": r["Pris"],
                 "Prisgrundlag": r["Type"],
                 "Senest set": "Denne uge",
+                "Svar": f"Aktuelt tilbud hos {r['Butik']} til {float(r['Pris']):.2f} kr.",
             })
             continue
 
         # Ingen aktuel avispris: brug kun en pris vi faktisk tidligere har observeret.
         hist = historical_best_price(item, organic_only=organic_only)
         if hist:
+            if hist.get("stale"):
+                answer = (
+                    f"Desværre ingen tilbud lige nu. Jeg har tidligere set varen hos {hist['store']} "
+                    f"til {hist['price']:.2f} kr., men prisen er over 60 dage gammel, så jeg bruger den ikke "
+                    f"til at udpege den billigste butik."
+                )
+                shown_store = "Historik: " + str(hist["store"])
+            else:
+                age_note = "Prisen er frisk." if hist.get("age", 999) <= 30 else f"Senest set for {hist.get('age')} dage siden."
+                answer = (
+                    f"Desværre ingen tilbud lige nu. Ud fra priser set de seneste 60 dage plejer den "
+                    f"at være billigst hos {hist['store']} til ca. {hist['price']:.2f} kr. {age_note}"
+                )
+                shown_store = hist["store"]
             rows.append({
                 "Du mangler": item,
-                "Butik": hist["store"],
+                "Butik": shown_store,
                 "Vare": hist["item"],
                 "Pris": hist["price"],
                 "Prisgrundlag": hist["label"],
                 "Senest set": hist["date"],
+                "Svar": answer,
             })
         else:
             rows.append({
@@ -403,6 +419,7 @@ def wishlist_match(data, items, organic_only=True):
                 "Pris": None,
                 "Prisgrundlag": "Ingen sikker pris endnu",
                 "Senest set": "",
+                "Svar": "Desværre ingen tilbud lige nu, og jeg har endnu ikke nok bonhistorik til at pege på den billigste butik.",
             })
 
     return pd.DataFrame(rows)
@@ -586,18 +603,32 @@ def historical_best_price(query, organic_only=True):
     client = supabase_client()
     if not client:
         return None
+
+    MAX_CURRENT_AGE_DAYS = 60
+    FRESH_AGE_DAYS = 30
+    today = date.today()
+    candidates = []
+
+    def age_days(value):
+        if not value:
+            return 99999
+        try:
+            d = datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
+            return (today - d).days
+        except Exception:
+            return 99999
+
     try:
         rows = client.table("price_observations").select(
             "item,normalized_item,store,price,price_type,organic,observed_date,unit_price,unit_name"
-        ).order("observed_date", desc=True).limit(1200).execute().data or []
+        ).order("observed_date", desc=True).limit(1500).execute().data or []
     except Exception:
-        return None
+        rows = []
 
-    matches = []
     for r in rows:
         if r.get("price_type") == "offer":
-            continue  # Et gammelt tilbud må ikke præsenteres som normalpris.
-        if organic_only and r.get("organic") is not True:
+            continue
+        if organic_only and r.get("organic") is not True and not looks_organic(r.get("item", "")):
             continue
         if match_score(query, r.get("item", "")) < 0.55:
             continue
@@ -607,34 +638,87 @@ def historical_best_price(query, organic_only=True):
             continue
         if price <= 0 or not r.get("store"):
             continue
-        matches.append(r)
-    if not matches:
+        candidates.append({
+            "item": r.get("item", ""),
+            "store": r.get("store"),
+            "price": price,
+            "date": r.get("observed_date", ""),
+            "age": age_days(r.get("observed_date")),
+        })
+
+    try:
+        purchases = client.table("purchases").select(
+            "item,store,normal_price,discount,paid_price,purchased_at"
+        ).order("purchased_at", desc=True).limit(1500).execute().data or []
+    except Exception:
+        purchases = []
+
+    for r in purchases:
+        item_name = r.get("item", "")
+        if match_score(query, item_name) < 0.55:
+            continue
+        if organic_only and not looks_organic(item_name):
+            continue
+        raw_price = r.get("normal_price")
+        if raw_price is None:
+            raw_price = r.get("paid_price")
+        try:
+            price = float(raw_price)
+        except Exception:
+            continue
+        if price <= 0 or not r.get("store"):
+            continue
+        candidates.append({
+            "item": item_name,
+            "store": r.get("store"),
+            "price": price,
+            "date": r.get("purchased_at", ""),
+            "age": age_days(r.get("purchased_at")),
+        })
+
+    if not candidates:
         return None
 
-    # Sammenlign butikker på medianen af observerede priser, så en enkelt særpris ikke vinder.
-    by_store = {}
-    for r in matches:
-        by_store.setdefault(r["store"], []).append(r)
-    ranked = []
-    for store, rs in by_store.items():
-        vals = sorted(float(x["price"]) for x in rs)
-        median = vals[len(vals)//2] if len(vals) % 2 else (vals[len(vals)//2-1]+vals[len(vals)//2])/2
-        latest = max(rs, key=lambda x: x.get("observed_date") or "")
-        ranked.append((median, latest))
-    ranked.sort(key=lambda x: x[0])
-    median, latest = ranked[0]
-    labels = {
-        "regular_observed": "Historisk normalpris fra bon",
-        "receipt_normal": "Normalpris fra bon med rabat",
-        "receipt_paid": "Historisk betalt pris",
-        "regular": "Historisk normalpris",
-    }
+    usable = [r for r in candidates if r["age"] <= MAX_CURRENT_AGE_DAYS]
+    if usable:
+        by_store = {}
+        for r in usable:
+            by_store.setdefault(r["store"], []).append(r)
+
+        ranked = []
+        for store, rs in by_store.items():
+            vals = sorted(float(x["price"]) for x in rs)
+            n = len(vals)
+            median = vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2
+            latest = min(rs, key=lambda x: x["age"])
+            ranked.append((median, len(rs), latest))
+
+        ranked.sort(key=lambda x: (x[0], -x[1]))
+        median, observations, latest = ranked[0]
+        freshness = "Frisk bonpris" if latest["age"] <= FRESH_AGE_DAYS else "Ældre bonpris"
+        return {
+            "store": latest["store"],
+            "item": latest["item"],
+            "price": round(median, 2),
+            "label": f"{freshness} ({observations} observationer)",
+            "date": latest.get("date", ""),
+            "observations": observations,
+            "stale": False,
+            "age": latest["age"],
+        }
+
+    # Alt er ældre end 60 dage: vis kun som historisk information,
+    # og brug det ikke til at kalde en butik aktuelt billigst.
+    latest_old = min(candidates, key=lambda x: x["age"])
     return {
-        "store": latest["store"],
-        "item": latest["item"],
-        "price": round(median, 2),
-        "label": labels.get(latest.get("price_type"), "Historisk observeret pris"),
-        "date": latest.get("observed_date", ""),
+        "store": latest_old["store"],
+        "item": latest_old["item"],
+        "price": round(float(latest_old["price"]), 2),
+        "label": "Historisk pris – over 60 dage gammel",
+        "date": latest_old.get("date", ""),
+        "observations": 1,
+        "stale": True,
+        "age": latest_old["age"],
     }
 
 
@@ -812,7 +896,9 @@ with tabs[1]:
             organic_only=organic_only,
         )
         st.dataframe(result, hide_index=True, use_container_width=True)
-        st.caption("Hvis der ikke er et aktuelt tilbud, bruger robotten kun historiske priser, den faktisk har observeret – aldrig en gættet normalpris.")
+        for answer in result.get("Svar", pd.Series(dtype=str)).dropna().tolist():
+            st.write(f"• {answer}")
+        st.caption("Hvis der ikke er et aktuelt tilbud, bruger robotten dine gemte bonpriser og andre priser, den faktisk har observeret – aldrig en gættet normalpris.")
         found = result["Pris"].dropna()
         if not found.empty:
             st.metric("Samlet pris for fundne varer", f"{found.sum():.2f} kr.")
@@ -989,4 +1075,4 @@ with tabs[6]:
     st.write("**Bon-OCR:**", "✅ aktiv" if ocr_key() else "⚠️ ikke aktiveret")
     st.caption("Netto+ og andre medlemsprogrammer er ikke datakilden. Gamle tilbud gemmes som tilbudshistorik og bruges aldrig som normalpris.")
 
-st.caption("Øko-robot v1.3.2 · flyer-first + prisrobot")
+st.caption("Øko-robot v1.3.4 · flyer-first + prisrobot")
