@@ -61,9 +61,19 @@ def normalize(text):
 
 def looks_organic(text):
     t = str(text).lower().strip()
-    return any(x in t for x in [
-        "økolog", " øko", "øgo", "änglamark", "salling øko", "365 øko"
-    ]) or bool(re.match(r"^o\s+[a-zæøå]", t))
+    # Boner skriver ofte ØKO helt først, fx "ØKO ARLA MINIMÆLK 1L".
+    # OCR kan også læse Ø som O.
+    return (
+        "økolog" in t
+        or t.startswith("øko ")
+        or " øko " in t
+        or t.startswith("øgo ")
+        or " øgo " in t
+        or "änglamark" in t
+        or "salling øko" in t
+        or "365 øko" in t
+        or bool(re.match(r"^o\s+[a-zæøå]", t))
+    )
 
 
 def money(text):
@@ -1075,4 +1085,4 @@ with tabs[6]:
     st.write("**Bon-OCR:**", "✅ aktiv" if ocr_key() else "⚠️ ikke aktiveret")
     st.caption("Netto+ og andre medlemsprogrammer er ikke datakilden. Gamle tilbud gemmes som tilbudshistorik og bruges aldrig som normalpris.")
 
-st.caption("Øko-robot v1.3.5 · flyer-first + prisrobot")
+st.caption("Øko-robot v1.3.6 · flyer-first + prisrobot")
