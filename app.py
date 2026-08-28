@@ -18,7 +18,7 @@ except Exception:
 
 st.set_page_config(page_title="Øko-robot", page_icon="🥬", layout="centered")
 st.title("🥬 Øko-robot")
-st.caption("v1.3.8 · tilbudsaviser + prisrobot")
+st.caption("v1.5.2 · ens varenavne + prisrobot")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
@@ -849,7 +849,12 @@ def historical_best_price(query, organic_only=True):
     for r in rows:
         if r.get("price_type") == "offer":
             continue
-        if organic_only and r.get("organic") is not True and not looks_organic(r.get("item", "")):
+        canonical_item = product_family(r.get("item", ""), rules=load_habit_rules())
+        if organic_only and (
+            r.get("organic") is not True
+            and not looks_organic(r.get("item", ""))
+            and not looks_organic(canonical_item or "")
+        ):
             continue
         if not same_product_family(query, r.get("item", "")) and match_score(query, r.get("item", "")) < 0.55:
             continue
@@ -879,7 +884,11 @@ def historical_best_price(query, organic_only=True):
         item_name = r.get("item", "")
         if not same_product_family(query, item_name) and match_score(query, item_name) < 0.55:
             continue
-        if organic_only and not looks_organic(item_name):
+        canonical_item = product_family(item_name, rules=load_habit_rules())
+        if organic_only and not (
+            looks_organic(item_name)
+            or looks_organic(canonical_item or "")
+        ):
             continue
         raw_price = r.get("normal_price")
         if raw_price is None:
@@ -1387,4 +1396,4 @@ with tabs[6]:
     st.write("**Bon-OCR:**", "✅ aktiv" if ocr_key() else "⚠️ ikke aktiveret")
     st.caption("Netto+ og andre medlemsprogrammer er ikke datakilden. Gamle tilbud gemmes som tilbudshistorik og bruges aldrig som normalpris.")
 
-st.caption("Øko-robot v1.5.1 · butikskrav + bedre varematch")
+st.caption("Øko-robot v1.5.2 · ens varenavne + prisrobot")
