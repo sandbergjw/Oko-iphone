@@ -18,7 +18,7 @@ except Exception:
 
 st.set_page_config(page_title="Øko-robot", page_icon="🥬", layout="centered")
 st.title("🥬 Øko-robot")
-st.caption("v1.3.7 · tilbudsaviser + prisrobot")
+st.caption("v1.3.8 · tilbudsaviser + prisrobot")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
@@ -57,6 +57,69 @@ def normalize(text):
         s = s.replace(token, "")
     s = re.sub(r"[^a-z0-9æøå%\- ]+", " ", s)
     return " ".join(s.split())
+
+
+def product_family(text):
+    """Saml bonnavne til en menneskelig grundvare uden at smide originaldata væk."""
+    raw = str(text).lower()
+    n = normalize(text)
+
+    families = [
+        ("kærnemælk", ("kærnemælk", "kaernemaelk", "kærnem", "kaernem")),
+        ("piskefløde", ("piskefløde", "piskeflø", "piskefloede", "piskeflo")),
+        ("græsk yoghurt", ("græsk yoghurt", "graesk yoghurt", "græsk yogurt", "graesk yogurt")),
+        ("minimælk", ("minimælk", "minimaelk")),
+        ("letmælk", ("letmælk", "letmaelk")),
+        ("sødmælk", ("sødmælk", "soedmaelk")),
+        ("leverpostej", ("leverpostej", "leverpost")),
+        ("æg", (" æg ", "æg ", " æg", "aeg")),
+    ]
+    padded = f" {n} "
+    for family, variants in families:
+        if any(v in raw or v in n or v in padded for v in variants):
+            return family
+
+    # Fjern typiske støjord fra boner: mærke, fedtprocent, størrelse og tal.
+    x = n
+    x = re.sub(r"\b(arla|engvang|løgismose|salling|365|lidl|rema|netto)\b", " ", x)
+    x = re.sub(r"\b\d+(?:[.,]\d+)?\s*(?:%|kg|g|l|ml|cl|stk)?\b", " ", x)
+    x = re.sub(r"\b(?:m|l|xl)\b", " ", x)
+    x = " ".join(x.split())
+    return x or n
+
+
+def habit_summary(history):
+    """Én række pr. grundvare/butik med nyttig pris- og købshistorik."""
+    if not history:
+        return pd.DataFrame()
+    df = pd.DataFrame(history)
+    if df.empty or "item" not in df.columns:
+        return pd.DataFrame()
+
+    df["Grundvare"] = df["item"].map(product_family)
+    df["Butik"] = df.get("store", pd.Series([""] * len(df))).fillna("")
+    df["Pris"] = pd.to_numeric(df.get("paid_price"), errors="coerce")
+    normal = pd.to_numeric(df.get("normal_price"), errors="coerce")
+    df["Pris"] = df["Pris"].fillna(normal)
+    df["Dato"] = pd.to_datetime(df.get("purchased_at"), errors="coerce")
+
+    rows = []
+    for (family, store), g in df.groupby(["Grundvare", "Butik"], dropna=False):
+        prices = g["Pris"].dropna()
+        dates = g["Dato"].dropna()
+        count = len(g)
+        level = "Fast vane" if count >= 4 else ("Mulig vane" if count >= 2 else "Engangskøb")
+        rows.append({
+            "Vare": family,
+            "Butik": store or "Ukendt",
+            "Køb": count,
+            "Typisk pris": round(float(prices.median()), 2) if not prices.empty else None,
+            "Laveste": round(float(prices.min()), 2) if not prices.empty else None,
+            "Seneste pris": round(float(g.sort_values("Dato")["Pris"].dropna().iloc[-1]), 2) if not prices.empty else None,
+            "Senest købt": dates.max().strftime("%d/%m/%Y") if not dates.empty else "",
+            "Vane": level,
+        })
+    return pd.DataFrame(rows).sort_values(["Køb", "Vare"], ascending=[False, True])
 
 
 def looks_organic(text):
@@ -345,6 +408,11 @@ ALIASES = {
     "kartofler": ["kartoffel", "kartofler"],
     "æbler": ["æble", "æbler"],
     "yoghurt": ["yoghurt", "skyr"],
+
+    "kærnemælk": ["kærnemælk", "kærnem", "kaernemaelk", "kaernem"],
+    "græsk yoghurt": ["græsk yoghurt", "græsk", "graesk yoghurt", "graesk"],
+    "græsk yogurt": ["græsk yoghurt", "græsk", "graesk yoghurt", "graesk"],
+    "piskefløde": ["piskefløde", "piskeflø", "piskefloede", "piskeflo"],
 }
 
 
@@ -355,8 +423,16 @@ def match_score(query, product, description=""):
         return 0
 
     aliases = ALIASES.get(q, [q])
-    if any(a in p for a in aliases):
-        return 1.0
+    for a in aliases:
+        if a in p:
+            return 1.0
+        # Bon-OCR kan forkorte lange varenavne, fx "kærnem" eller "græsk".
+        # Brug kun præfiks-match på ord på mindst 5 tegn.
+        if len(a) >= 5:
+            for pw in p.split():
+                if len(pw) >= 5 and (a.startswith(pw) or pw.startswith(a)):
+                    if min(len(a), len(pw)) >= 5:
+                        return 0.95
 
     qa = set(q.split())
     pa = set(p.split())
@@ -1049,12 +1125,27 @@ with tabs[4]:
             st.warning("Jeg kunne ikke finde sikre varelinjer endnu. Ret eventuelt bonteksten ovenfor og prøv igen.")
 
 with tabs[5]:
-    st.subheader("Det robotten har lært")
+    st.subheader("Dine vaner")
     history = load_purchase_history()
-    if history:
-        st.markdown("### 💰 Dine bonpriser")
-        pdf = pd.DataFrame(history)
-        if not pdf.empty:
+    if not history:
+        st.info("Ingen gemte bonkøb endnu.")
+    else:
+        summary = habit_summary(history)
+        if summary.empty:
+            st.info("Ingen vaner kunne samles endnu.")
+        else:
+            st.caption("Samme grundvare samles automatisk, så gentagne køb ikke fylder listen.")
+            for _, r in summary.iterrows():
+                price = "–" if pd.isna(r["Typisk pris"]) else f'{r["Typisk pris"]:.2f} kr.'
+                low = "–" if pd.isna(r["Laveste"]) else f'{r["Laveste"]:.2f} kr.'
+                latest = "–" if pd.isna(r["Seneste pris"]) else f'{r["Seneste pris"]:.2f} kr.'
+                st.markdown(f"**{str(r['Vare']).capitalize()}** · {r['Vane']}")
+                st.write(f"{r['Butik']} · købt {int(r['Køb'])} gange · typisk {price}")
+                st.caption(f"Laveste {low} · seneste {latest} · sidst købt {r['Senest købt']}")
+                st.divider()
+
+        with st.expander("Se alle rå bonlinjer"):
+            pdf = pd.DataFrame(history)
             show = pd.DataFrame({
                 "Dato": pdf.get("purchased_at"),
                 "Butik": pdf.get("store"),
@@ -1064,20 +1155,6 @@ with tabs[5]:
                 "Betalt": pdf.get("paid_price"),
             })
             st.dataframe(show, hide_index=True, use_container_width=True)
-        st.markdown("### 🧠 Købsvaner")
-    h = load_habits()
-    if not h:
-        st.info("Ingen gemte varer endnu.")
-    else:
-        rows = []
-        for item, count in sorted(h.items(), key=lambda x: x[1], reverse=True):
-            level = "Fast vane" if count >= 4 else ("Mulig vane" if count >= 2 else "Engangskøb")
-            rows.append([item, count, level])
-        st.dataframe(
-            pd.DataFrame(rows, columns=["Vare", "Køb", "Vane"]),
-            hide_index=True,
-            use_container_width=True,
-        )
 
 with tabs[6]:
     st.subheader("Datakilder")
@@ -1099,4 +1176,4 @@ with tabs[6]:
     st.write("**Bon-OCR:**", "✅ aktiv" if ocr_key() else "⚠️ ikke aktiveret")
     st.caption("Netto+ og andre medlemsprogrammer er ikke datakilden. Gamle tilbud gemmes som tilbudshistorik og bruges aldrig som normalpris.")
 
-st.caption("Øko-robot v1.3.7 · flyer-first + prisrobot")
+st.caption("Øko-robot v1.4 · smartere vaner + prisrobot")
