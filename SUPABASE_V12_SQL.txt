@@ -1,0 +1,22 @@
+create table if not exists public.purchases (
+  id uuid primary key,
+  item text not null,
+  normalized_item text not null,
+  store text,
+  normal_price numeric,
+  discount numeric not null default 0,
+  paid_price numeric,
+  quantity_text text,
+  purchased_at date not null default current_date,
+  created_at timestamptz not null default now()
+);
+
+alter table public.purchases enable row level security;
+
+drop policy if exists "allow anon purchases insert" on public.purchases;
+create policy "allow anon purchases insert"
+on public.purchases for insert to anon with check (true);
+
+drop policy if exists "allow anon purchases select" on public.purchases;
+create policy "allow anon purchases select"
+on public.purchases for select to anon using (true);

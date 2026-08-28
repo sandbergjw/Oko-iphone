@@ -18,7 +18,7 @@ except Exception:
 
 st.set_page_config(page_title="Øko-robot", page_icon="🥬", layout="centered")
 st.title("🥬 Øko-robot")
-st.caption("v1.1 · tilbudsaviser først")
+st.caption("v1.2 · tilbudsaviser + prishukommelse")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
@@ -427,6 +427,129 @@ def parse_receipt(text):
     return pd.DataFrame(rows)
 
 
+
+# ---------- v1.2: intelligent bon + prishukommelse ----------
+def load_purchase_history():
+    client = supabase_client()
+    if client:
+        try:
+            return client.table("purchases").select("*").order("purchased_at", desc=True).execute().data or []
+        except Exception:
+            return []
+    return []
+
+def save_purchase_history(df, store):
+    client = supabase_client()
+    if not client:
+        raise RuntimeError("Supabase er ikke forbundet.")
+    payload = []
+    for _, row in df.iterrows():
+        name = str(row.get("Vare", "")).strip()
+        if not name:
+            continue
+        def num(v):
+            try:
+                if pd.isna(v) or v == "":
+                    return None
+                return float(v)
+            except Exception:
+                return None
+        normal = num(row.get("Normalpris"))
+        discount = abs(num(row.get("Rabat")) or 0.0)
+        paid = num(row.get("Betalt pris"))
+        if paid is None and normal is not None:
+            paid = round(max(0, normal - discount), 2)
+        payload.append({
+            "id": str(uuid.uuid4()),
+            "item": name,
+            "normalized_item": normalize(name),
+            "store": store or None,
+            "normal_price": normal,
+            "discount": discount,
+            "paid_price": paid,
+            "quantity_text": str(row.get("Mængde", "")).strip() or None,
+            "purchased_at": datetime.now(timezone.utc).date().isoformat(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+    if payload:
+        client.table("purchases").insert(payload).execute()
+    return len(payload)
+
+def receipt_amount(line):
+    m = re.search(r"(-?\s*\d{1,4}[,.]\d{2})\s*(?:kr)?\s*$", line)
+    if not m:
+        return None, None
+    try:
+        return float(m.group(1).replace(" ", "").replace(",", ".")), m
+    except Exception:
+        return None, None
+
+def parse_receipt_smart(text):
+    rows = []
+    discount_words = ("rabat", "discount", "kupon", "bonus")
+    ignore_words = ("total", "visa", "moms", "dankort", "kontant", "betaling",
+                    "subtotal", "at betale", "returbeløb")
+    for raw in text.splitlines():
+        line = re.sub(r"\s+", " ", raw).strip()
+        if len(line) < 2:
+            continue
+        low = line.lower()
+        if any(w in low for w in ignore_words):
+            continue
+        amount, match = receipt_amount(line)
+        is_discount = any(w in low for w in discount_words) or (amount is not None and amount < 0)
+        if is_discount:
+            if amount is not None and rows:
+                disc = abs(amount)
+                rows[-1]["Rabat"] = round(rows[-1]["Rabat"] + disc, 2)
+                rows[-1]["Betalt pris"] = round(max(0, rows[-1]["Normalpris"] - rows[-1]["Rabat"]), 2)
+            continue
+        if amount is None or not re.search(r"[A-Za-zÆØÅæøå]", line):
+            continue
+        name = line[:match.start()].strip(" .:-*")
+        name = re.sub(r"\b(x\d+|\d+\s*x)\b", " ", name, flags=re.I)
+        name = re.sub(r"\s+", " ", name).strip()
+        if len(name) < 2:
+            continue
+        qm = re.search(r"(\d+(?:[,.]\d+)?)\s*(kg|g|l|ml|stk)\b", name, re.I)
+        rows.append({
+            "Vare": name[:120],
+            "Normalpris": round(amount, 2),
+            "Rabat": 0.0,
+            "Betalt pris": round(amount, 2),
+            "Mængde": qm.group(0) if qm else "",
+        })
+    return pd.DataFrame(rows)
+
+def price_stats(query):
+    history = load_purchase_history()
+    prices = []
+    for row in history:
+        if match_score(query, row.get("item", "")) >= 0.55:
+            try:
+                p = float(row.get("paid_price"))
+                if p > 0:
+                    prices.append(p)
+            except Exception:
+                pass
+    if not prices:
+        return None
+    return {"n": len(prices), "avg": sum(prices)/len(prices), "min": min(prices), "max": max(prices)}
+
+def price_verdict(query, offer):
+    stats = price_stats(query)
+    if not stats:
+        return "Ny vare – ingen prishistorik"
+    pct = (stats["avg"] - float(offer)) / stats["avg"] * 100
+    if pct >= 15:
+        return f"🔥 {pct:.0f}% billigere end du plejer"
+    if pct >= 5:
+        return f"👍 {pct:.0f}% billigere end du plejer"
+    if pct > -5:
+        return "≈ Omkring din normale pris"
+    return "⚠️ Dyrere end du plejer"
+
+
 if "flyer_data" not in st.session_state:
     st.session_state["flyer_data"] = pd.DataFrame()
 if "source_status" not in st.session_state:
@@ -568,15 +691,33 @@ with tabs[4]:
         ["", "Netto", "REMA 1000", "365discount", "Lidl", "føtex", "Nemlig.com"],
     )
     if text:
-        parsed = parse_receipt(text)
+        parsed = parse_receipt_smart(text)
         if not parsed.empty:
             edited = st.data_editor(parsed, num_rows="dynamic", hide_index=True, use_container_width=True)
-            if st.button("Gem bon og lær", type="primary"):
-                n, where = save_habits(edited["Vare"].tolist(), store)
-                st.success(f"{n} varer gemt via {where}.")
+            if st.button("💾 Gem køb, priser og rabatter", type="primary"):
+                try:
+                    n = save_purchase_history(edited, store)
+                    st.success(f"{n} køb gemt i Supabase. Robotten husker nu de faktiske priser.")
+                except Exception as e:
+                    st.error(f"Kunne ikke gemme: {e}")
 
 with tabs[5]:
     st.subheader("Det robotten har lært")
+    history = load_purchase_history()
+    if history:
+        st.markdown("### 💰 Prishistorik")
+        pdf = pd.DataFrame(history)
+        if not pdf.empty:
+            show = pd.DataFrame({
+                "Dato": pdf.get("purchased_at"),
+                "Butik": pdf.get("store"),
+                "Vare": pdf.get("item"),
+                "Normalpris": pdf.get("normal_price"),
+                "Rabat": pdf.get("discount"),
+                "Betalt": pdf.get("paid_price"),
+            })
+            st.dataframe(show, hide_index=True, use_container_width=True)
+        st.markdown("### 🧠 Købsvaner")
     h = load_habits()
     if not h:
         st.info("Ingen gemte varer endnu.")
