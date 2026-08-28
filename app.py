@@ -688,7 +688,7 @@ def save_purchase_history(df, store):
     return len(payload)
 
 def receipt_amount(line):
-    m = re.search(r"(-?\s*\d{1,4}[,.]\d{2})\s*(?:kr)?\s*$", line)
+    m = re.search(r"(-?\s*\d{1,4}[,.]\d{2})\s*(?:kr)?\s*[A-Z]?\s*$", line)
     if not m:
         return None, None
     try:
@@ -926,14 +926,17 @@ with tabs[4]:
     )
     if text:
         parsed = parse_receipt_smart(text)
+        st.markdown("### Varer fundet på bonen")
         if not parsed.empty:
             edited = st.data_editor(parsed, num_rows="dynamic", hide_index=True, use_container_width=True)
-            if st.button("💾 Gem køb, priser og rabatter", type="primary"):
+            if st.button("💾 Gem køb, priser og rabatter", type="primary", use_container_width=True):
                 try:
                     n = save_purchase_history(edited, store)
                     st.success(f"{n} køb gemt i Supabase. Robotten husker nu de faktiske priser.")
                 except Exception as e:
                     st.error(f"Kunne ikke gemme: {e}")
+        else:
+            st.warning("Jeg kunne ikke finde sikre varelinjer endnu. Ret eventuelt bonteksten ovenfor og prøv igen.")
 
 with tabs[5]:
     st.subheader("Det robotten har lært")
@@ -986,4 +989,4 @@ with tabs[6]:
     st.write("**Bon-OCR:**", "✅ aktiv" if ocr_key() else "⚠️ ikke aktiveret")
     st.caption("Netto+ og andre medlemsprogrammer er ikke datakilden. Gamle tilbud gemmes som tilbudshistorik og bruges aldrig som normalpris.")
 
-st.caption("Øko-robot v1.3 · flyer-first + prisrobot")
+st.caption("Øko-robot v1.3.2 · flyer-first + prisrobot")
