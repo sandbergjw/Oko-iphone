@@ -18,7 +18,7 @@ except Exception:
 
 st.set_page_config(page_title="Øko-robot", page_icon="🥬", layout="centered")
 st.title("🥬 Øko-robot")
-st.caption("v1.7 · prisvurdering")
+st.caption("v1.7.1 · smør ≠ smørbar")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
@@ -90,6 +90,8 @@ def product_family(text, rules=None):
         ("minimælk", ("minimælk", "minimaelk")),
         ("letmælk", ("letmælk", "letmaelk")),
         ("sødmælk", ("sødmælk", "soedmaelk")),
+        ("smørbar", ("smørbar", "smørbart", "blandingsprodukt", "smørblanding")),
+        ("smør", (" smør ", "smør 200", "smør 250", "smør 500", "butter")),
         ("leverpostej", ("leverpostej", "leverpost")),
         ("æg", (" æg ", "æg ", " æg", "aeg")),
     ]
@@ -493,6 +495,7 @@ ALIASES = {
     "banan": ["banan", "bananer"],
     "bananer": ["banan", "bananer"],
     "smør": ["smør"],
+    "smørbar": ["smørbar", "smørbart", "blandingsprodukt", "smørblanding"],
     "pasta": ["pasta", "spaghetti", "penne", "fusilli"],
     "rugbrød": ["rugbrød"],
     "hakket kød": ["hakket oksekød", "hakket kød", "hakket gris", "hakket kylling"],
@@ -531,6 +534,20 @@ def match_score(query, product, description=""):
     p_family = product_family(f"{product} {description}", rules=rules)
     if q_family and p_family and normalize(q_family) == normalize(p_family):
         return 1.0
+
+    # "Smør" og "smørbar" er forskellige produkter.
+    # En søgning efter rigtig smør må ikke ramme smørbar/blandingsprodukt.
+    if q == "smør" and (
+        "smørbar" in p
+        or "smørbart" in p
+        or "blandingsprodukt" in p
+        or "smørblanding" in p
+    ):
+        return 0
+    if q == "smørbar" and " smør " in f" {p} " and not any(
+        x in p for x in ("smørbar", "smørbart", "blandingsprodukt", "smørblanding")
+    ):
+        return 0
 
     aliases = ALIASES.get(q, [q])
     for a in aliases:
@@ -1530,4 +1547,4 @@ with tabs[6]:
     st.write("**Bon-OCR:**", "✅ aktiv" if ocr_key() else "⚠️ ikke aktiveret")
     st.caption("Netto+ og andre medlemsprogrammer er ikke datakilden. Gamle tilbud gemmes som tilbudshistorik og bruges aldrig som normalpris.")
 
-st.caption("Øko-robot v1.7 · prisvurdering")
+st.caption("Øko-robot v1.7.1 · smør ≠ smørbar")
