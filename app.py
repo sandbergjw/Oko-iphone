@@ -18,7 +18,7 @@ except Exception:
 
 st.set_page_config(page_title="Øko-robot", page_icon="🥬", layout="centered")
 st.title("🥬 Øko-robot")
-st.caption("v1.6.1 · multipak + dublet-fix")
+st.caption("v1.7 · prisvurdering")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
@@ -589,16 +589,19 @@ def wishlist_match(data, items, organic_only=True):
                 f"{r.get('Vare', '')} {r.get('Beskrivelse', '')}"
             )
             enhed = f"{upr:.2f} kr/{uunit}" if upr is not None and uunit else ""
+            verdict, verdict_note = price_verdict(item, float(r["Pris"]))
             rows.append({
                 "Du mangler": item,
                 "Butik": r["Butik"],
                 "Vare": r["Vare"],
                 "Pris": r["Pris"],
+                "Vurdering": verdict,
                 "Enhedspris": enhed,
                 "Prisgrundlag": r["Type"],
                 "Senest set": "Denne uge",
                 "Svar": (
-                    f"Aktuelt tilbud hos {r['Butik']} til {float(r['Pris']):.2f} kr."
+                    f"Aktuelt tilbud hos {r['Butik']} til {float(r['Pris']):.2f} kr. "
+                    f"{verdict} – {verdict_note}."
                     + (f" ({enhed})" if enhed else "")
                 ),
             })
@@ -627,11 +630,13 @@ def wishlist_match(data, items, organic_only=True):
                     hist_unit = f"{float(hist['unit_price']):.2f} kr/{hist['unit_name']}"
                 except Exception:
                     hist_unit = ""
+            hist_verdict, hist_verdict_note = price_verdict(item, hist["price"])
             rows.append({
                 "Du mangler": item,
                 "Butik": shown_store,
                 "Vare": hist["item"],
                 "Pris": hist["price"],
+                "Vurdering": hist_verdict,
                 "Enhedspris": hist_unit,
                 "Prisgrundlag": hist["label"],
                 "Senest set": hist["date"],
@@ -643,6 +648,7 @@ def wishlist_match(data, items, organic_only=True):
                 "Butik": "Ikke fundet",
                 "Vare": "",
                 "Pris": None,
+                "Vurdering": "",
                 "Enhedspris": "",
                 "Prisgrundlag": "Ingen sikker pris endnu",
                 "Senest set": "",
@@ -1149,32 +1155,50 @@ def parse_receipt_smart(text):
     return df.drop(columns=["_antal", "_linjetotal"], errors="ignore")
 
 def price_stats(query):
+    """Prisniveau fra brugerens egne køb af samme grundvare."""
     history = load_purchase_history()
     prices = []
+    rules = load_habit_rules()
     for row in history:
-        if match_score(query, row.get("item", "")) >= 0.55:
-            try:
-                p = float(row.get("paid_price"))
-                if p > 0:
-                    prices.append(p)
-            except Exception:
-                pass
+        item_name = row.get("item", "")
+        if not same_product_family(query, item_name) and match_score(query, item_name) < 0.55:
+            continue
+        try:
+            p = float(row.get("paid_price"))
+            if p > 0:
+                prices.append(p)
+        except Exception:
+            pass
     if not prices:
         return None
-    return {"n": len(prices), "avg": sum(prices)/len(prices), "min": min(prices), "max": max(prices)}
+    prices = sorted(prices)
+    median = float(pd.Series(prices).median())
+    return {
+        "n": len(prices),
+        "median": median,
+        "avg": sum(prices) / len(prices),
+        "min": min(prices),
+        "max": max(prices),
+    }
 
-def price_verdict(query, offer):
+
+def price_verdict(query, price):
+    """Forsigtig vurdering: bruger medianen af faktiske tidligere køb."""
     stats = price_stats(query)
     if not stats:
-        return "Ny vare – ingen prishistorik"
-    pct = (stats["avg"] - float(offer)) / stats["avg"] * 100
+        return "🆕 Ny pris", "Ikke nok prishistorik endnu"
+    normal = stats["median"]
+    if normal <= 0:
+        return "🆕 Ny pris", "Ikke nok prishistorik endnu"
+    pct = (normal - float(price)) / normal * 100
+
     if pct >= 15:
-        return f"🔥 {pct:.0f}% billigere end du plejer"
+        return "🔥 Superpris", f"{pct:.0f}% under din typiske pris"
     if pct >= 5:
-        return f"👍 {pct:.0f}% billigere end du plejer"
+        return "👍 God pris", f"{pct:.0f}% under din typiske pris"
     if pct > -5:
-        return "≈ Omkring din normale pris"
-    return "⚠️ Dyrere end du plejer"
+        return "😐 Normal pris", f"omkring din typiske pris på {normal:.2f} kr."
+    return "⚠️ Dyrt", f"{abs(pct):.0f}% over din typiske pris"
 
 
 if "flyer_data" not in st.session_state:
@@ -1227,8 +1251,22 @@ with tabs[1]:
             organic_only=organic_only,
         )
         st.dataframe(result, hide_index=True, use_container_width=True)
-        for answer in result.get("Svar", pd.Series(dtype=str)).dropna().tolist():
-            st.write(f"• {answer}")
+        st.markdown("### Prisrobotten siger")
+        for _, rr in result.iterrows():
+            vare = str(rr.get("Du mangler", ""))
+            butik = str(rr.get("Butik", ""))
+            pris = rr.get("Pris")
+            vurdering = str(rr.get("Vurdering", "") or "")
+            try:
+                pris_txt = f"{float(pris):.2f} kr."
+            except Exception:
+                pris_txt = "Ingen sikker pris"
+            st.markdown(f"**{vare}** · {vurdering}")
+            st.write(f"{butik} · {pris_txt}")
+            if rr.get("Enhedspris"):
+                st.caption(str(rr.get("Enhedspris")))
+            st.caption(str(rr.get("Svar", "")))
+            st.divider()
         st.caption("Hvis der ikke er et aktuelt tilbud, bruger robotten dine gemte bonpriser og andre priser, den faktisk har observeret – aldrig en gættet normalpris.")
         found = result["Pris"].dropna()
         if not found.empty:
@@ -1492,4 +1530,4 @@ with tabs[6]:
     st.write("**Bon-OCR:**", "✅ aktiv" if ocr_key() else "⚠️ ikke aktiveret")
     st.caption("Netto+ og andre medlemsprogrammer er ikke datakilden. Gamle tilbud gemmes som tilbudshistorik og bruges aldrig som normalpris.")
 
-st.caption("Øko-robot v1.6.1 · multipak + dublet-fix")
+st.caption("Øko-robot v1.7 · prisvurdering")
