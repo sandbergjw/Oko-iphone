@@ -18,7 +18,7 @@ except Exception:
 
 st.set_page_config(page_title="Øko-robot", page_icon="🥬", layout="centered")
 st.title("🥬 Øko-robot")
-st.caption("v1.6 · multipak + enhedspriser")
+st.caption("v1.6.1 · multipak + dublet-fix")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
@@ -739,11 +739,30 @@ def save_price_observations(payload):
     client = supabase_client()
     if not client or not payload:
         return 0
-    # SQL-filen opretter en unik indeks, så samme pris ikke gemmes igen og igen samme dag.
+
+    # En bon kan indeholde samme vare flere gange til samme pris.
+    # Supabase kan ikke upserte to identiske konflikt-nøgler i samme kommando,
+    # så vi fjerner dubletter i payloaden først.
+    unique = {}
+    for row in payload:
+        key = (
+            str(row.get("store") or ""),
+            str(row.get("normalized_item") or ""),
+            str(row.get("observed_date") or ""),
+            str(row.get("price_type") or ""),
+            str(row.get("price") or ""),
+        )
+        unique[key] = row
+
+    clean_payload = list(unique.values())
+    if not clean_payload:
+        return 0
+
     client.table("price_observations").upsert(
-        payload, on_conflict="store,normalized_item,observed_date,price_type,price"
+        clean_payload,
+        on_conflict="store,normalized_item,observed_date,price_type,price"
     ).execute()
-    return len(payload)
+    return len(clean_payload)
 
 
 def save_offer_snapshots(df):
@@ -1473,4 +1492,4 @@ with tabs[6]:
     st.write("**Bon-OCR:**", "✅ aktiv" if ocr_key() else "⚠️ ikke aktiveret")
     st.caption("Netto+ og andre medlemsprogrammer er ikke datakilden. Gamle tilbud gemmes som tilbudshistorik og bruges aldrig som normalpris.")
 
-st.caption("Øko-robot v1.6 · multipak + enhedspriser")
+st.caption("Øko-robot v1.6.1 · multipak + dublet-fix")
