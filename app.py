@@ -18,7 +18,7 @@ except Exception:
 
 st.set_page_config(page_title="Øko-robot", page_icon="🥬", layout="centered")
 st.title("🥬 Øko-robot")
-st.caption("v1.7.1 · smør ≠ smørbar")
+st.caption("v1.8 · Nemlig prisrobot")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
@@ -44,6 +44,13 @@ SECONDARY_FLYER_SOURCES = {
 ONLINE_ONLY = {
     "Nemlig.com": "https://www.nemlig.com/tilbud",
 }
+NEMLIG_CATALOG_PAGES = [
+    "https://www.nemlig.com/dagligvarer/nye-varer-inspiration/oekologi",
+    "https://www.nemlig.com/dagligvarer/mejeri",
+    "https://www.nemlig.com/dagligvarer/frugt-groent",
+    "https://www.nemlig.com/dagligvarer/koed-fisk",
+    "https://www.nemlig.com/dagligvarer/broed-bager",
+]
 
 LOCAL_HABITS = Path("habits.json")
 
@@ -415,37 +422,99 @@ def scrape_365_flyer():
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def scrape_nemlig_online():
-    """Nemlig har ikke klassisk ugeavis; beholdes særskilt som online tilbud."""
-    url = ONLINE_ONLY["Nemlig.com"]
-    r = requests.get(url, headers=HEADERS, timeout=25)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
+    """
+    Nemlig er en onlinebutik, ikke en klassisk tilbudsavis.
+    Hent både tilbud og offentligt synlige katalogpriser, men hold typerne adskilt.
+    Vi gemmer aldrig en pris, medmindre pris + produkttekst kan findes på samme produktkort.
+    """
     rows = []
 
-    for el in soup.find_all(["article", "li", "div"]):
-        txt = " ".join(el.stripped_strings)
-        if not (5 < len(txt) < 500):
-            continue
-        if not looks_organic(txt):
-            continue
-        pr = money(txt)
-        if pr is None:
-            continue
-        chunks = [x.strip() for x in el.stripped_strings if len(x.strip()) > 2]
-        name = chunks[0][:140] if chunks else txt[:140]
-        rows.append({
-            "Butik": "Nemlig.com",
-            "Vare": name,
-            "Beskrivelse": "",
-            "Pris": pr,
-            "Øko": True,
-            "Avis": "",
-            "Side": "",
-            "Kilde": url,
-            "Type": "Online tilbud",
-        })
+    def parse_page(url, price_type):
+        r = requests.get(url, headers=HEADERS, timeout=25, allow_redirects=True)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
 
-    return pd.DataFrame(rows).drop_duplicates(subset=["Vare", "Pris"]).head(100) if rows else pd.DataFrame()
+        # Nemlig kan ændre frontend. Vi prøver derfor flere almindelige produktkort,
+        # men kræver altid et lokalt produktnavn og en pris i samme element.
+        selectors = [
+            "article",
+            "[class*='product-card']",
+            "[class*='productCard']",
+            "[data-product-id]",
+            "li[class*='product']",
+        ]
+        seen_nodes = set()
+        candidates = []
+        for selector in selectors:
+            for el in soup.select(selector):
+                ident = id(el)
+                if ident not in seen_nodes:
+                    seen_nodes.add(ident)
+                    candidates.append(el)
+
+        for el in candidates:
+            txt = " ".join(el.stripped_strings)
+            if not (5 < len(txt) < 900):
+                continue
+
+            # Pris skal være eksplicit i kortet. money() bruges kun på kortets egen tekst.
+            pr = money(txt)
+            if pr is None or pr <= 0 or pr > 5000:
+                continue
+
+            chunks = [re.sub(r"\s+", " ", x).strip()
+                      for x in el.stripped_strings if 2 < len(x.strip()) < 180]
+            if not chunks:
+                continue
+
+            # Vælg første tekststump der ligner et varenavn, ikke pris/badge/navigation.
+            name = ""
+            for chunk in chunks:
+                low = chunk.lower()
+                if re.fullmatch(r"[\d\s,.]+(?:kr\.?)?", low):
+                    continue
+                if low in {"tilbud", "prismatch", "premium", "læg i kurv", "se mere"}:
+                    continue
+                if any(word in low for word in ("cookie", "log ind", "kundeservice")):
+                    continue
+                name = chunk[:140]
+                break
+            if not name:
+                continue
+
+            rows.append({
+                "Butik": "Nemlig.com",
+                "Vare": name,
+                "Beskrivelse": txt[:300],
+                "Pris": float(pr),
+                "Øko": looks_organic(txt),
+                "Avis": "",
+                "Side": "",
+                "Kilde": url,
+                "Type": price_type,
+            })
+
+    # Tilbud har sin egen type og må gerne indgå som aktuelt tilbud.
+    try:
+        parse_page(ONLINE_ONLY["Nemlig.com"], "Online tilbud")
+    except Exception:
+        pass
+
+    # Katalogsider bruges som aktuelle online-normalpriser/prisreference.
+    # De må ikke fejlagtigt kaldes tilbud.
+    for url in NEMLIG_CATALOG_PAGES:
+        try:
+            parse_page(url, "Online pris")
+        except Exception:
+            continue
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    df = df.drop_duplicates(subset=["Vare", "Pris", "Type"])
+    # Begræns kun dubletter/støj – ikke antallet til 100 som før.
+    return df.reset_index(drop=True)
 
 
 def fetch_all(include_nemlig=True):
@@ -472,11 +541,11 @@ def fetch_all(include_nemlig=True):
     if include_nemlig:
         try:
             nemlig = scrape_nemlig_online()
-            status.append(("Nemlig.com", len(nemlig), "Online tilbud"))
+            status.append(("Nemlig.com", len(nemlig), "Online tilbud + priser"))
             if not nemlig.empty:
                 frames.append(nemlig)
         except Exception:
-            status.append(("Nemlig.com", 0, "Kunne ikke læse online tilbud"))
+            status.append(("Nemlig.com", 0, "Kunne ikke læse online priser"))
 
     data = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
         columns=["Butik", "Vare", "Beskrivelse", "Pris", "Øko", "Avis", "Side", "Kilde", "Type"]
@@ -599,8 +668,15 @@ def wishlist_match(data, items, organic_only=True):
                 candidates.append((s, r))
 
         if candidates:
-            candidates.sort(key=lambda x: (-x[0], x[1]["Pris"]))
-            _, r = candidates[0]
+            # Først rigtige tilbud. Nemlig "Online pris" er en aktuel prisreference
+            # og bruges kun hvis der ikke findes et aktuelt tilbud på varen.
+            offer_candidates = [
+                x for x in candidates
+                if str(x[1].get("Type", "")).strip().lower() != "online pris"
+            ]
+            pool = offer_candidates if offer_candidates else candidates
+            pool.sort(key=lambda x: (-x[0], x[1]["Pris"]))
+            _, r = pool[0]
             upr, uunit = unit_price(
                 float(r["Pris"]),
                 f"{r.get('Vare', '')} {r.get('Beskrivelse', '')}"
@@ -617,8 +693,12 @@ def wishlist_match(data, items, organic_only=True):
                 "Prisgrundlag": r["Type"],
                 "Senest set": "Denne uge",
                 "Svar": (
-                    f"Aktuelt tilbud hos {r['Butik']} til {float(r['Pris']):.2f} kr. "
-                    f"{verdict} – {verdict_note}."
+                    (
+                        f"Aktuel onlinepris hos {r['Butik']} til {float(r['Pris']):.2f} kr. "
+                        if str(r.get("Type", "")).strip().lower() == "online pris"
+                        else f"Aktuelt tilbud hos {r['Butik']} til {float(r['Pris']):.2f} kr. "
+                    )
+                    + f"{verdict} – {verdict_note}."
                     + (f" ({enhed})" if enhed else "")
                 ),
             })
@@ -811,7 +891,11 @@ def save_offer_snapshots(df):
             "normalized_item": normalize(name),
             "store": str(r.get("Butik", "")) or None,
             "price": price,
-            "price_type": "offer",
+            "price_type": (
+                "regular_observed"
+                if str(r.get("Type", "")).strip().lower() == "online pris"
+                else "offer"
+            ),
             "organic": bool(r.get("Øko", False)),
             "quantity_text": qtxt or None,
             "unit_price": upr,
@@ -1248,7 +1332,7 @@ with tabs[1]:
     st.subheader("Hvad vil du gerne købe?")
     txt = st.text_area(
         "Én varetype pr. linje",
-        "Græsk yoghurt\nMinimælk\nBananer\nÆg",
+        "Græsk yoghurt\nMinimælk\nBananer\nÆg\nSmør\nHakket oksekød\nKærnemælk\nSødmælk",
         height=190,
     )
     organic_only = st.toggle("Kun økologiske tilbud", value=True)
@@ -1547,4 +1631,4 @@ with tabs[6]:
     st.write("**Bon-OCR:**", "✅ aktiv" if ocr_key() else "⚠️ ikke aktiveret")
     st.caption("Netto+ og andre medlemsprogrammer er ikke datakilden. Gamle tilbud gemmes som tilbudshistorik og bruges aldrig som normalpris.")
 
-st.caption("Øko-robot v1.7.1 · smør ≠ smørbar")
+st.caption("Øko-robot v1.8 · Nemlig prisrobot")
