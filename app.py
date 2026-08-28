@@ -18,7 +18,7 @@ except Exception:
 
 st.set_page_config(page_title="Øko-robot", page_icon="🥬", layout="centered")
 st.title("🥬 Øko-robot")
-st.caption("v1.3 · tilbudsaviser + prisrobot")
+st.caption("v1.3.7 · tilbudsaviser + prisrobot")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
@@ -61,18 +61,15 @@ def normalize(text):
 
 def looks_organic(text):
     t = str(text).lower().strip()
-    # Boner skriver ofte ØKO helt først, fx "ØKO ARLA MINIMÆLK 1L".
-    # OCR kan også læse Ø som O.
+    # Accepter også bon/OCR-varianter som "Øko. Kærnemælk",
+    # "ØKO ARLA..." og "O ARLA..." hvor Ø er læst som O.
     return (
         "økolog" in t
-        or t.startswith("øko ")
-        or " øko " in t
-        or t.startswith("øgo ")
-        or " øgo " in t
+        or bool(re.search(r"(^|\s)(?:øko|øgo)(?:\s|[.,;:()/-]|$)", t))
         or "änglamark" in t
         or "salling øko" in t
         or "365 øko" in t
-        or bool(re.match(r"^o\s+[a-zæøå]", t))
+        or bool(re.match(r"^o(?:\s|[.,;:()/-])", t))
     )
 
 
@@ -365,7 +362,24 @@ def match_score(query, product, description=""):
     pa = set(p.split())
     if not qa or not pa:
         return 0
-    return len(qa & pa) / len(qa | pa)
+
+    exact = len(qa & pa) / len(qa | pa)
+    if exact > 0:
+        return exact
+
+    # OCR kan klippe slutningen af et langt ord:
+    # fx "piskefløde" -> "piskeflø".
+    for qw in qa:
+        if len(qw) < 5:
+            continue
+        for pw in pa:
+            if len(pw) < 5:
+                continue
+            shorter = min(len(qw), len(pw))
+            if shorter >= 6 and (qw.startswith(pw) or pw.startswith(qw)):
+                return 0.9
+
+    return 0
 
 
 def wishlist_match(data, items, organic_only=True):
@@ -1085,4 +1099,4 @@ with tabs[6]:
     st.write("**Bon-OCR:**", "✅ aktiv" if ocr_key() else "⚠️ ikke aktiveret")
     st.caption("Netto+ og andre medlemsprogrammer er ikke datakilden. Gamle tilbud gemmes som tilbudshistorik og bruges aldrig som normalpris.")
 
-st.caption("Øko-robot v1.3.6 · flyer-first + prisrobot")
+st.caption("Øko-robot v1.3.7 · flyer-first + prisrobot")
