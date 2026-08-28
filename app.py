@@ -18,7 +18,7 @@ except Exception:
 
 st.set_page_config(page_title="Øko-robot", page_icon="🥬", layout="centered")
 st.title("🥬 Øko-robot")
-st.caption("v1.5.2 · ens varenavne + prisrobot")
+st.caption("v1.6 · multipak + enhedspriser")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
@@ -584,14 +584,23 @@ def wishlist_match(data, items, organic_only=True):
         if candidates:
             candidates.sort(key=lambda x: (-x[0], x[1]["Pris"]))
             _, r = candidates[0]
+            upr, uunit = unit_price(
+                float(r["Pris"]),
+                f"{r.get('Vare', '')} {r.get('Beskrivelse', '')}"
+            )
+            enhed = f"{upr:.2f} kr/{uunit}" if upr is not None and uunit else ""
             rows.append({
                 "Du mangler": item,
                 "Butik": r["Butik"],
                 "Vare": r["Vare"],
                 "Pris": r["Pris"],
+                "Enhedspris": enhed,
                 "Prisgrundlag": r["Type"],
                 "Senest set": "Denne uge",
-                "Svar": f"Aktuelt tilbud hos {r['Butik']} til {float(r['Pris']):.2f} kr.",
+                "Svar": (
+                    f"Aktuelt tilbud hos {r['Butik']} til {float(r['Pris']):.2f} kr."
+                    + (f" ({enhed})" if enhed else "")
+                ),
             })
             continue
 
@@ -612,14 +621,21 @@ def wishlist_match(data, items, organic_only=True):
                     f"at være billigst hos {hist['store']} til ca. {hist['price']:.2f} kr. {age_note}"
                 )
                 shown_store = hist["store"]
+            hist_unit = ""
+            if hist.get("unit_price") is not None and hist.get("unit_name"):
+                try:
+                    hist_unit = f"{float(hist['unit_price']):.2f} kr/{hist['unit_name']}"
+                except Exception:
+                    hist_unit = ""
             rows.append({
                 "Du mangler": item,
                 "Butik": shown_store,
                 "Vare": hist["item"],
                 "Pris": hist["price"],
+                "Enhedspris": hist_unit,
                 "Prisgrundlag": hist["label"],
                 "Senest set": hist["date"],
-                "Svar": answer,
+                "Svar": answer + (f" Enhedspris: {hist_unit}." if hist_unit else ""),
             })
         else:
             rows.append({
@@ -627,6 +643,7 @@ def wishlist_match(data, items, organic_only=True):
                 "Butik": "Ikke fundet",
                 "Vare": "",
                 "Pris": None,
+                "Enhedspris": "",
                 "Prisgrundlag": "Ingen sikker pris endnu",
                 "Senest set": "",
                 "Svar": "Desværre ingen tilbud lige nu, og jeg har endnu ikke nok bonhistorik til at pege på den billigste butik.",
@@ -790,7 +807,8 @@ def save_receipt_price_observations(df, store):
             # Hvis der ikke var rabat, er bonens pris vores bedste observation af en almindelig hyldepris.
             if ptype == "receipt_normal" and discount == 0:
                 ptype = "regular_observed"
-            upr, uunit = unit_price(price, qtxt or name)
+            # Pakkepris gemmes pr. pakke; kr/kg, kr/l eller kr/stk beregnes ud fra varenavnet.
+            upr, uunit = unit_price(price, name)
             payload.append({
                 "id": str(uuid.uuid4()),
                 "item": name,
@@ -869,6 +887,8 @@ def historical_best_price(query, organic_only=True):
             "item": r.get("item", ""),
             "store": r.get("store"),
             "price": price,
+            "unit_price": r.get("unit_price"),
+            "unit_name": r.get("unit_name"),
             "date": r.get("observed_date", ""),
             "age": age_days(r.get("observed_date")),
         })
@@ -900,10 +920,13 @@ def historical_best_price(query, organic_only=True):
         store_name = str(r.get("store") or "").strip()
         if price <= 0 or store_name.lower() in ("", "ukendt", "unknown", "none"):
             continue
+        upr, uunit = unit_price(price, item_name)
         candidates.append({
             "item": item_name,
             "store": r.get("store"),
             "price": price,
+            "unit_price": upr,
+            "unit_name": uunit,
             "date": r.get("purchased_at", ""),
             "age": age_days(r.get("purchased_at")),
         })
@@ -1020,6 +1043,7 @@ def parse_receipt_smart(text):
     discount_words = ("rabat", "discount", "kupon", "bonus")
     ignore_words = ("total", "visa", "moms", "dankort", "kontant", "betaling",
                     "subtotal", "at betale", "returbeløb")
+
     for raw in text.splitlines():
         line = re.sub(r"\s+", " ", raw).strip()
         if len(line) < 2:
@@ -1027,30 +1051,83 @@ def parse_receipt_smart(text):
         low = line.lower()
         if any(w in low for w in ignore_words):
             continue
+
         amount, match = receipt_amount(line)
         is_discount = any(w in low for w in discount_words) or (amount is not None and amount < 0)
+
         if is_discount:
             if amount is not None and rows:
-                disc = abs(amount)
-                rows[-1]["Rabat"] = round(rows[-1]["Rabat"] + disc, 2)
-                rows[-1]["Betalt pris"] = round(max(0, rows[-1]["Normalpris"] - rows[-1]["Rabat"]), 2)
+                disc_total = abs(amount)
+                qty = int(rows[-1].get("_antal", 1) or 1)
+                # Rabatten på bonlinjen er typisk for hele linjen.
+                # Prisrobotten gemmer per pakke/enhed, så fordel rabatten.
+                disc_per_item = round(disc_total / max(qty, 1), 2)
+                rows[-1]["Rabat"] = round(rows[-1]["Rabat"] + disc_per_item, 2)
+                rows[-1]["Betalt pris"] = round(
+                    max(0, rows[-1]["Normalpris"] - rows[-1]["Rabat"]), 2
+                )
             continue
+
         if amount is None or not re.search(r"[A-Za-zÆØÅæøå]", line):
             continue
-        name = line[:match.start()].strip(" .:-*")
+
+        before_total = line[:match.start()].strip(" .:-*")
+
+        # Eksempler fra boner:
+        # "Øko. æg 10 stk. M/L 36,95 x 2 73,90 B"
+        # "Øko. minimælk 12,95 x 3 38,85 B"
+        # Her er sidste beløb linjetotalen, mens 36,95 / 12,95 er pakkeprisen.
+        multi = re.search(
+            r"(\d{1,4}[,.]\d{2})\s*[x×]\s*(\d{1,3})\s*$",
+            before_total,
+            re.I,
+        )
+
+        qty = 1
+        unit_normal = float(amount)
+        name = before_total
+
+        if multi:
+            try:
+                unit_candidate = float(multi.group(1).replace(",", "."))
+                qty_candidate = int(multi.group(2))
+                expected_total = round(unit_candidate * qty_candidate, 2)
+
+                # OCR kan afvige få øre. Accepter en lille tolerance.
+                if qty_candidate >= 2 and abs(expected_total - float(amount)) <= 0.15:
+                    unit_normal = unit_candidate
+                    qty = qty_candidate
+                    name = before_total[:multi.start()].strip(" .:-*")
+            except Exception:
+                pass
+
         name = re.sub(r"\b(x\d+|\d+\s*x)\b", " ", name, flags=re.I)
         name = re.sub(r"\s+", " ", name).strip()
         if len(name) < 2:
             continue
-        qtxt, _, _ = quantity_info(name)
+
+        pack_text, _, _ = quantity_info(name)
+        if qty > 1:
+            qtxt = f"{pack_text} · købt {qty}".strip(" ·") if pack_text else f"købt {qty}"
+        else:
+            qtxt = pack_text
+
         rows.append({
             "Vare": name[:120],
-            "Normalpris": round(amount, 2),
+            "Normalpris": round(unit_normal, 2),
             "Rabat": 0.0,
-            "Betalt pris": round(amount, 2),
+            "Betalt pris": round(unit_normal, 2),
             "Mængde": qtxt,
+            "_antal": qty,
+            "_linjetotal": round(float(amount), 2),
         })
-    return pd.DataFrame(rows)
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    # Interne hjælpefelter bruges kun under parsing.
+    return df.drop(columns=["_antal", "_linjetotal"], errors="ignore")
 
 def price_stats(query):
     history = load_purchase_history()
@@ -1111,7 +1188,7 @@ with tabs[1]:
     st.subheader("Hvad vil du gerne købe?")
     txt = st.text_area(
         "Én varetype pr. linje",
-        "mælk\næg\npasta\nhakket kød\nbananer",
+        "Græsk yoghurt\nMinimælk\nBananer\nÆg",
         height=190,
     )
     organic_only = st.toggle("Kun økologiske tilbud", value=True)
@@ -1396,4 +1473,4 @@ with tabs[6]:
     st.write("**Bon-OCR:**", "✅ aktiv" if ocr_key() else "⚠️ ikke aktiveret")
     st.caption("Netto+ og andre medlemsprogrammer er ikke datakilden. Gamle tilbud gemmes som tilbudshistorik og bruges aldrig som normalpris.")
 
-st.caption("Øko-robot v1.5.2 · ens varenavne + prisrobot")
+st.caption("Øko-robot v1.6 · multipak + enhedspriser")
