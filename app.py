@@ -18,7 +18,7 @@ except Exception:
 
 st.set_page_config(page_title="Øko-robot", page_icon="🥬", layout="centered")
 st.title("🥬 Øko-robot")
-st.caption("v1.2 · tilbudsaviser + prishukommelse")
+st.caption("v1.3 · tilbudsaviser + prisrobot")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
@@ -99,8 +99,21 @@ def ocr_key():
 
 
 def load_habits():
+    """Købsvaner kommer først fra den nye purchases-tabel."""
     sb = supabase_client()
     if sb:
+        try:
+            rows = sb.table("purchases").select("item").execute().data or []
+            result = {}
+            for r in rows:
+                k = normalize(r.get("item", ""))
+                if k:
+                    result[k] = result.get(k, 0) + 1
+            if result:
+                return result
+        except Exception:
+            pass
+        # Bagudkompatibilitet med de første versioner
         try:
             rows = sb.table("receipt_items").select("item").execute().data or []
             result = {}
@@ -108,7 +121,8 @@ def load_habits():
                 k = normalize(r.get("item", ""))
                 if k:
                     result[k] = result.get(k, 0) + 1
-            return result
+            if result:
+                return result
         except Exception:
             pass
 
@@ -301,6 +315,11 @@ def fetch_all(include_nemlig=True):
     data = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
         columns=["Butik", "Vare", "Beskrivelse", "Pris", "Øko", "Avis", "Side", "Kilde", "Type"]
     )
+    # Gem det robotten så i dag. Fejl i prishukommelsen må aldrig blokere avis-læsningen.
+    try:
+        save_offer_snapshots(data)
+    except Exception:
+        pass
     return data, status
 
 
@@ -352,25 +371,39 @@ def wishlist_match(data, items, organic_only=True):
             if s >= 0.34:
                 candidates.append((s, r))
 
-        if not candidates:
+        if candidates:
+            candidates.sort(key=lambda x: (-x[0], x[1]["Pris"]))
+            _, r = candidates[0]
             rows.append({
                 "Du mangler": item,
-                "Butik": "Ikke fundet",
-                "Tilbud": "",
-                "Pris": None,
-                "Kilde-type": "",
+                "Butik": r["Butik"],
+                "Vare": r["Vare"],
+                "Pris": r["Pris"],
+                "Prisgrundlag": r["Type"],
+                "Senest set": "Denne uge",
             })
             continue
 
-        candidates.sort(key=lambda x: (-x[0], x[1]["Pris"]))
-        s, r = candidates[0]
-        rows.append({
-            "Du mangler": item,
-            "Butik": r["Butik"],
-            "Tilbud": r["Vare"],
-            "Pris": r["Pris"],
-            "Kilde-type": r["Type"],
-        })
+        # Ingen aktuel avispris: brug kun en pris vi faktisk tidligere har observeret.
+        hist = historical_best_price(item, organic_only=organic_only)
+        if hist:
+            rows.append({
+                "Du mangler": item,
+                "Butik": hist["store"],
+                "Vare": hist["item"],
+                "Pris": hist["price"],
+                "Prisgrundlag": hist["label"],
+                "Senest set": hist["date"],
+            })
+        else:
+            rows.append({
+                "Du mangler": item,
+                "Butik": "Ikke fundet",
+                "Vare": "",
+                "Pris": None,
+                "Prisgrundlag": "Ingen sikker pris endnu",
+                "Senest set": "",
+            })
 
     return pd.DataFrame(rows)
 
@@ -428,6 +461,183 @@ def parse_receipt(text):
 
 
 
+# ---------- v1.3: fælles prishukommelse ----------
+def quantity_info(text):
+    """Find pakkestørrelse og omregningsgrundlag til kg/l/stk når muligt."""
+    t = str(text).lower().replace(",", ".")
+    multi = re.search(r"(\d+)\s*[x×]\s*(\d+(?:\.\d+)?)\s*(kg|g|l|ml|cl|stk)\b", t)
+    if multi:
+        n = float(multi.group(1)); val = float(multi.group(2)); unit = multi.group(3)
+        amount = n * val
+        if unit == "g": amount /= 1000; base = "kg"
+        elif unit == "ml": amount /= 1000; base = "l"
+        elif unit == "cl": amount /= 100; base = "l"
+        else: base = unit
+        return multi.group(0), amount, base
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(kg|g|l|ml|cl|stk)\b", t)
+    if not m:
+        return "", None, None
+    val = float(m.group(1)); unit = m.group(2)
+    if unit == "g": return m.group(0), val/1000, "kg"
+    if unit == "ml": return m.group(0), val/1000, "l"
+    if unit == "cl": return m.group(0), val/100, "l"
+    return m.group(0), val, unit
+
+
+def unit_price(price, text):
+    _, amount, base = quantity_info(text)
+    if amount and amount > 0:
+        return round(float(price) / amount, 2), base
+    return None, None
+
+
+def save_price_observations(payload):
+    client = supabase_client()
+    if not client or not payload:
+        return 0
+    # SQL-filen opretter en unik indeks, så samme pris ikke gemmes igen og igen samme dag.
+    client.table("price_observations").upsert(
+        payload, on_conflict="store,normalized_item,observed_date,price_type,price"
+    ).execute()
+    return len(payload)
+
+
+def save_offer_snapshots(df):
+    if df is None or df.empty:
+        return 0
+    today = datetime.now(timezone.utc).date().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
+    payload = []
+    for _, r in df.iterrows():
+        name = str(r.get("Vare", "")).strip()
+        try:
+            price = float(r.get("Pris"))
+        except Exception:
+            continue
+        if not name or price <= 0:
+            continue
+        desc = str(r.get("Beskrivelse", ""))
+        qtxt, _, _ = quantity_info(f"{name} {desc}")
+        upr, uunit = unit_price(price, f"{name} {desc}")
+        payload.append({
+            "id": str(uuid.uuid4()),
+            "item": name,
+            "normalized_item": normalize(name),
+            "store": str(r.get("Butik", "")) or None,
+            "price": price,
+            "price_type": "offer",
+            "organic": bool(r.get("Øko", False)),
+            "quantity_text": qtxt or None,
+            "unit_price": upr,
+            "unit_name": uunit,
+            "observed_date": today,
+            "source_url": str(r.get("Kilde", "")) or None,
+            "created_at": now,
+        })
+    return save_price_observations(payload)
+
+
+def save_receipt_price_observations(df, store):
+    today = datetime.now(timezone.utc).date().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
+    payload = []
+    for _, row in df.iterrows():
+        name = str(row.get("Vare", "")).strip()
+        if not name:
+            continue
+        def num(v):
+            try:
+                if pd.isna(v) or v == "": return None
+                return float(v)
+            except Exception:
+                return None
+        normal = num(row.get("Normalpris"))
+        paid = num(row.get("Betalt pris"))
+        discount = abs(num(row.get("Rabat")) or 0.0)
+        qtxt = str(row.get("Mængde", "")).strip()
+        if not qtxt:
+            qtxt, _, _ = quantity_info(name)
+        for ptype, price in (("receipt_normal", normal), ("receipt_paid", paid)):
+            if price is None or price <= 0:
+                continue
+            # Hvis der ikke var rabat, er bonens pris vores bedste observation af en almindelig hyldepris.
+            if ptype == "receipt_normal" and discount == 0:
+                ptype = "regular_observed"
+            upr, uunit = unit_price(price, qtxt or name)
+            payload.append({
+                "id": str(uuid.uuid4()),
+                "item": name,
+                "normalized_item": normalize(name),
+                "store": store or None,
+                "price": price,
+                "price_type": ptype,
+                "organic": looks_organic(name),
+                "quantity_text": qtxt or None,
+                "unit_price": upr,
+                "unit_name": uunit,
+                "observed_date": today,
+                "source_url": None,
+                "created_at": now,
+            })
+    return save_price_observations(payload)
+
+
+def historical_best_price(query, organic_only=True):
+    client = supabase_client()
+    if not client:
+        return None
+    try:
+        rows = client.table("price_observations").select(
+            "item,normalized_item,store,price,price_type,organic,observed_date,unit_price,unit_name"
+        ).order("observed_date", desc=True).limit(1200).execute().data or []
+    except Exception:
+        return None
+
+    matches = []
+    for r in rows:
+        if r.get("price_type") == "offer":
+            continue  # Et gammelt tilbud må ikke præsenteres som normalpris.
+        if organic_only and r.get("organic") is not True:
+            continue
+        if match_score(query, r.get("item", "")) < 0.55:
+            continue
+        try:
+            price = float(r.get("price"))
+        except Exception:
+            continue
+        if price <= 0 or not r.get("store"):
+            continue
+        matches.append(r)
+    if not matches:
+        return None
+
+    # Sammenlign butikker på medianen af observerede priser, så en enkelt særpris ikke vinder.
+    by_store = {}
+    for r in matches:
+        by_store.setdefault(r["store"], []).append(r)
+    ranked = []
+    for store, rs in by_store.items():
+        vals = sorted(float(x["price"]) for x in rs)
+        median = vals[len(vals)//2] if len(vals) % 2 else (vals[len(vals)//2-1]+vals[len(vals)//2])/2
+        latest = max(rs, key=lambda x: x.get("observed_date") or "")
+        ranked.append((median, latest))
+    ranked.sort(key=lambda x: x[0])
+    median, latest = ranked[0]
+    labels = {
+        "regular_observed": "Historisk normalpris fra bon",
+        "receipt_normal": "Normalpris fra bon med rabat",
+        "receipt_paid": "Historisk betalt pris",
+        "regular": "Historisk normalpris",
+    }
+    return {
+        "store": latest["store"],
+        "item": latest["item"],
+        "price": round(median, 2),
+        "label": labels.get(latest.get("price_type"), "Historisk observeret pris"),
+        "date": latest.get("observed_date", ""),
+    }
+
+
 # ---------- v1.2: intelligent bon + prishukommelse ----------
 def load_purchase_history():
     client = supabase_client()
@@ -473,6 +683,8 @@ def save_purchase_history(df, store):
         })
     if payload:
         client.table("purchases").insert(payload).execute()
+        # Samme bon fodrer også den fælles prisdatabase.
+        save_receipt_price_observations(df, store)
     return len(payload)
 
 def receipt_amount(line):
@@ -511,13 +723,13 @@ def parse_receipt_smart(text):
         name = re.sub(r"\s+", " ", name).strip()
         if len(name) < 2:
             continue
-        qm = re.search(r"(\d+(?:[,.]\d+)?)\s*(kg|g|l|ml|stk)\b", name, re.I)
+        qtxt, _, _ = quantity_info(name)
         rows.append({
             "Vare": name[:120],
             "Normalpris": round(amount, 2),
             "Rabat": 0.0,
             "Betalt pris": round(amount, 2),
-            "Mængde": qm.group(0) if qm else "",
+            "Mængde": qtxt,
         })
     return pd.DataFrame(rows)
 
@@ -558,10 +770,11 @@ if "source_status" not in st.session_state:
 tabs = st.tabs(["🏠", "📝 Jeg mangler", "📰 Aviser", "🎯 Til mig", "📸 Bon", "🧠 Vaner", "⚙️"])
 
 with tabs[0]:
-    st.success("Nu læser robotten tilbudsaviser – ikke Netto+")
+    st.success("Nu læser robotten tilbudsaviser og bygger sin egen prishukommelse")
     st.write(
         "Netto, REMA 1000, Lidl, føtex og 365discount behandles som **tilbudsaviser**. "
-        "Nemlig.com står separat som **online tilbud**, fordi Nemlig ikke har en klassisk ugeavis."
+        "Nemlig.com står separat som **online tilbud**, fordi Nemlig ikke har en klassisk ugeavis. "
+        "Hver gang aviserne læses, gemmes de priser robotten faktisk har set."
     )
     a, b = st.columns(2)
     a.metric("Tilbudsaviser", 5)
@@ -585,7 +798,7 @@ with tabs[1]:
     organic_only = st.toggle("Kun økologiske tilbud", value=True)
     include_nemlig_w = st.toggle("Tag Nemlig.com med", value=True, key="nemlig_w")
 
-    if st.button("Match mod tilbudsaviser", type="primary"):
+    if st.button("Find bedste pris", type="primary"):
         data = st.session_state["flyer_data"]
         if data.empty:
             with st.spinner("Læser tilbudsaviserne først…"):
@@ -599,6 +812,7 @@ with tabs[1]:
             organic_only=organic_only,
         )
         st.dataframe(result, hide_index=True, use_container_width=True)
+        st.caption("Hvis der ikke er et aktuelt tilbud, bruger robotten kun historiske priser, den faktisk har observeret – aldrig en gættet normalpris.")
         found = result["Pris"].dropna()
         if not found.empty:
             st.metric("Samlet pris for fundne varer", f"{found.sum():.2f} kr.")
@@ -666,7 +880,27 @@ with tabs[3]:
 
 with tabs[4]:
     st.subheader("Scan bon")
-    camera = st.camera_input("📷 Tag billede af bon")
+
+    # Kameraet er slukket som standard. Brugeren tænder det aktivt,
+    # så iPhone ikke åbner kameravisningen bare ved at gå ind på Bon.
+    if "receipt_camera_on" not in st.session_state:
+        st.session_state["receipt_camera_on"] = False
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if not st.session_state["receipt_camera_on"]:
+            if st.button("📷 Tænd kamera", use_container_width=True):
+                st.session_state["receipt_camera_on"] = True
+                st.rerun()
+        else:
+            if st.button("⏹️ Sluk kamera", use_container_width=True):
+                st.session_state["receipt_camera_on"] = False
+                st.rerun()
+
+    camera = None
+    if st.session_state["receipt_camera_on"]:
+        camera = st.camera_input("📷 Tag billede af bon")
+
     upload = st.file_uploader("🖼️ Vælg bon fra Fotos", type=["jpg", "jpeg", "png", "webp"])
     source = camera or upload
 
@@ -705,7 +939,7 @@ with tabs[5]:
     st.subheader("Det robotten har lært")
     history = load_purchase_history()
     if history:
-        st.markdown("### 💰 Prishistorik")
+        st.markdown("### 💰 Dine bonpriser")
         pdf = pd.DataFrame(history)
         if not pdf.empty:
             show = pd.DataFrame({
@@ -750,6 +984,6 @@ with tabs[6]:
     st.divider()
     st.write("**Permanent lagring:**", "✅ Supabase" if supabase_client() else "⚠️ lokal fallback")
     st.write("**Bon-OCR:**", "✅ aktiv" if ocr_key() else "⚠️ ikke aktiveret")
-    st.caption("Netto+ og andre medlemsprogrammer er ikke datakilden i denne version.")
+    st.caption("Netto+ og andre medlemsprogrammer er ikke datakilden. Gamle tilbud gemmes som tilbudshistorik og bruges aldrig som normalpris.")
 
-st.caption("Øko-robot v1.1 · flyer-first")
+st.caption("Øko-robot v1.3 · flyer-first + prisrobot")

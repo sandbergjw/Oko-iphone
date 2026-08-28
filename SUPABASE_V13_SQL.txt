@@ -1,0 +1,42 @@
+-- Øko-robot v1.3: fælles prishukommelse
+-- Kør hele denne blok én gang i Supabase > SQL Editor.
+
+create table if not exists public.price_observations (
+  id uuid primary key,
+  item text not null,
+  normalized_item text not null,
+  store text,
+  price numeric not null,
+  price_type text not null,
+  organic boolean,
+  quantity_text text,
+  unit_price numeric,
+  unit_name text,
+  observed_date date not null default current_date,
+  source_url text,
+  created_at timestamptz not null default now()
+);
+
+alter table public.price_observations enable row level security;
+
+drop policy if exists "allow anon price observations select" on public.price_observations;
+create policy "allow anon price observations select"
+on public.price_observations for select to anon using (true);
+
+drop policy if exists "allow anon price observations insert" on public.price_observations;
+create policy "allow anon price observations insert"
+on public.price_observations for insert to anon with check (true);
+
+drop policy if exists "allow anon price observations update" on public.price_observations;
+create policy "allow anon price observations update"
+on public.price_observations for update to anon using (true) with check (true);
+
+grant usage on schema public to anon;
+grant select, insert, update on table public.price_observations to anon;
+
+-- Forhindrer at samme vare/pris gemmes flere gange samme dag.
+create unique index if not exists price_observations_daily_unique
+on public.price_observations (store, normalized_item, observed_date, price_type, price);
+
+-- Behold også de grants, som v1.2 bruger.
+grant select, insert on table public.purchases to anon;
