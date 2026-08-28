@@ -59,15 +59,34 @@ def normalize(text):
     return " ".join(s.split())
 
 
-def product_family(text):
-    """Saml bonnavne til en menneskelig grundvare uden at smide originaldata væk."""
-    raw = str(text).lower()
+def product_family(text, rules=None):
+    """Saml bonnavne til en menneskelig grundvare. Manuelle regler vinder over automatik."""
+    raw_text = str(text)
+    raw = raw_text.lower()
     n = normalize(text)
+
+    # Manuelle rettelser fra Vaner har første prioritet.
+    if rules is None:
+        try:
+            rules = load_habit_rules()
+        except Exception:
+            rules = {}
+    rule = rules.get(n) if isinstance(rules, dict) else None
+    if rule:
+        if rule.get("hidden"):
+            return None
+        target = str(rule.get("target_name") or "").strip()
+        if target:
+            return target
 
     families = [
         ("kærnemælk", ("kærnemælk", "kaernemaelk", "kærnem", "kaernem")),
         ("piskefløde", ("piskefløde", "piskeflø", "piskefloede", "piskeflo")),
-        ("græsk yoghurt", ("græsk yoghurt", "graesk yoghurt", "græsk yogurt", "graesk yogurt")),
+        ("græsk yoghurt", (
+            "græsk yoghurt", "graesk yoghurt", "græsk yogurt", "graesk yogurt",
+            "græsk yog", "graesk yog", "græsk yo", "graesk yo",
+            "græsk", "graesk", "grsk yoghurt", "grsk yog", "grsk"
+        )),
         ("minimælk", ("minimælk", "minimaelk")),
         ("letmælk", ("letmælk", "letmaelk")),
         ("sødmælk", ("sødmælk", "soedmaelk")),
@@ -96,7 +115,12 @@ def habit_summary(history):
     if df.empty or "item" not in df.columns:
         return pd.DataFrame()
 
-    df["Grundvare"] = df["item"].map(product_family)
+    rules = load_habit_rules()
+    df["Grundvare"] = df["item"].map(lambda x: product_family(x, rules=rules))
+    df = df[df["Grundvare"].notna() & (df["Grundvare"].astype(str).str.strip() != "")]
+    if df.empty:
+        return pd.DataFrame()
+
     df["Butik"] = df.get("store", pd.Series([""] * len(df))).fillna("")
     df["Pris"] = pd.to_numeric(df.get("paid_price"), errors="coerce")
     normal = pd.to_numeric(df.get("normal_price"), errors="coerce")
@@ -166,6 +190,69 @@ def ocr_key():
         return st.secrets["OCRSPACE_API_KEY"]
     except Exception:
         return None
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_habit_rules():
+    """Manuelle sammenkædninger, omdøbninger og skjulte varer."""
+    sb = supabase_client()
+    if not sb:
+        return {}
+    try:
+        rows = sb.table("habit_rules").select("*").execute().data or []
+        return {
+            str(r.get("source_normalized") or ""): {
+                "source_item": r.get("source_item"),
+                "target_name": r.get("target_name"),
+                "hidden": bool(r.get("hidden")),
+            }
+            for r in rows if r.get("source_normalized")
+        }
+    except Exception:
+        return {}
+
+
+def save_habit_rule(source_item, target_name=None, hidden=False):
+    sb = supabase_client()
+    if not sb:
+        raise RuntimeError("Supabase er ikke forbundet.")
+    source_item = str(source_item).strip()
+    if not source_item:
+        raise ValueError("Vælg en vare.")
+    payload = {
+        "source_normalized": normalize(source_item),
+        "source_item": source_item,
+        "target_name": (str(target_name).strip() or None) if target_name is not None else None,
+        "hidden": bool(hidden),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    sb.table("habit_rules").upsert(payload, on_conflict="source_normalized").execute()
+    load_habit_rules.clear()
+
+
+def delete_habit_rule(source_item):
+    sb = supabase_client()
+    if not sb:
+        raise RuntimeError("Supabase er ikke forbundet.")
+    sb.table("habit_rules").delete().eq("source_normalized", normalize(source_item)).execute()
+    load_habit_rules.clear()
+
+
+def permanently_delete_raw_item(source_item):
+    """Slet alle køb med præcis dette rå bonnavn samt dets bon-prisobservationer."""
+    sb = supabase_client()
+    if not sb:
+        raise RuntimeError("Supabase er ikke forbundet.")
+    norm = normalize(source_item)
+    sb.table("purchases").delete().eq("normalized_item", norm).execute()
+    # Slet kun bonbaserede priser – aldrig tilbudsavis-observationer.
+    for typ in ("receipt_normal", "receipt_paid", "regular_observed"):
+        sb.table("price_observations").delete().eq("normalized_item", norm).eq("price_type", typ).execute()
+    try:
+        sb.table("habit_rules").delete().eq("source_normalized", norm).execute()
+    except Exception:
+        pass
+    load_habit_rules.clear()
 
 
 def load_habits():
@@ -410,8 +497,16 @@ ALIASES = {
     "yoghurt": ["yoghurt", "skyr"],
 
     "kærnemælk": ["kærnemælk", "kærnem", "kaernemaelk", "kaernem"],
-    "græsk yoghurt": ["græsk yoghurt", "græsk", "graesk yoghurt", "graesk"],
-    "græsk yogurt": ["græsk yoghurt", "græsk", "graesk yoghurt", "graesk"],
+    "græsk yoghurt": [
+        "græsk yoghurt", "græsk yogurt", "graesk yoghurt", "graesk yogurt",
+        "græsk yog", "graesk yog", "græsk yo", "graesk yo",
+        "græsk", "graesk", "grsk yoghurt", "grsk yog", "grsk"
+    ],
+    "græsk yogurt": [
+        "græsk yoghurt", "græsk yogurt", "graesk yoghurt", "graesk yogurt",
+        "græsk yog", "graesk yog", "græsk yo", "graesk yo",
+        "græsk", "graesk", "grsk yoghurt", "grsk yog", "grsk"
+    ],
     "piskefløde": ["piskefløde", "piskeflø", "piskefloede", "piskeflo"],
 }
 
@@ -421,6 +516,14 @@ def match_score(query, product, description=""):
     p = normalize(f"{product} {description}")
     if not q or not p:
         return 0
+
+    # Hvis både søgning og bon/avis kan reduceres til samme grundvare,
+    # skal de matche selv om bonen kun skriver fx "GRÆSK", "GRÆSK YOG" osv.
+    rules = load_habit_rules()
+    q_family = product_family(query, rules=rules)
+    p_family = product_family(f"{product} {description}", rules=rules)
+    if q_family and p_family and normalize(q_family) == normalize(p_family):
+        return 1.0
 
     aliases = ALIASES.get(q, [q])
     for a in aliases:
@@ -1127,14 +1230,15 @@ with tabs[4]:
 with tabs[5]:
     st.subheader("Dine vaner")
     history = load_purchase_history()
+
     if not history:
         st.info("Ingen gemte bonkøb endnu.")
     else:
         summary = habit_summary(history)
         if summary.empty:
-            st.info("Ingen vaner kunne samles endnu.")
+            st.info("Ingen synlige vaner endnu.")
         else:
-            st.caption("Samme grundvare samles automatisk, så gentagne køb ikke fylder listen.")
+            st.caption("Samme grundvare samles automatisk. Dine manuelle rettelser har altid første prioritet.")
             for _, r in summary.iterrows():
                 price = "–" if pd.isna(r["Typisk pris"]) else f'{r["Typisk pris"]:.2f} kr.'
                 low = "–" if pd.isna(r["Laveste"]) else f'{r["Laveste"]:.2f} kr.'
@@ -1143,6 +1247,85 @@ with tabs[5]:
                 st.write(f"{r['Butik']} · købt {int(r['Køb'])} gange · typisk {price}")
                 st.caption(f"Laveste {low} · seneste {latest} · sidst købt {r['Senest købt']}")
                 st.divider()
+
+        raw_names = sorted({str(x.get("item", "")).strip() for x in history if str(x.get("item", "")).strip()})
+
+        st.markdown("### ✏️ Ret vaner")
+        mode = st.radio(
+            "Hvad vil du gøre?",
+            ["Sammenkæd / omdøb", "Fjern fra vaner", "Fortryd manuel rettelse", "Slet varehistorik permanent"],
+            horizontal=False,
+        )
+
+        if mode == "Sammenkæd / omdøb":
+            chosen = st.multiselect(
+                "Vælg én eller flere bon-varianter",
+                raw_names,
+                help="Vælger du flere, bliver de samlet under det samme navn.",
+            )
+            target = st.text_input("Navnet de skal samles under", placeholder="fx Græsk yoghurt")
+            if st.button("💾 Gem sammenkædning", type="primary"):
+                if not chosen or not target.strip():
+                    st.warning("Vælg mindst én vare og skriv det nye navn.")
+                else:
+                    try:
+                        for item in chosen:
+                            save_habit_rule(item, target_name=target, hidden=False)
+                        st.success(f"{len(chosen)} varevariant(er) er nu samlet som “{target.strip()}”.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Kunne ikke gemme rettelsen: {e}")
+
+        elif mode == "Fjern fra vaner":
+            chosen = st.multiselect(
+                "Vælg varer der ikke skal tælle som vaner",
+                raw_names,
+                help="Bon- og prisdata bevares. Varen skjules kun i Vaner.",
+            )
+            if st.button("🙈 Fjern fra Vaner", type="primary"):
+                if not chosen:
+                    st.warning("Vælg mindst én vare.")
+                else:
+                    try:
+                        for item in chosen:
+                            save_habit_rule(item, target_name=None, hidden=True)
+                        st.success("Varen er fjernet fra Vaner, men bonhistorikken er bevaret.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Kunne ikke gemme ændringen: {e}")
+
+        elif mode == "Fortryd manuel rettelse":
+            rules = load_habit_rules()
+            rule_names = sorted([
+                r.get("source_item") or key for key, r in rules.items()
+            ])
+            chosen = st.multiselect("Vælg manuelle rettelser der skal nulstilles", rule_names)
+            if st.button("↩️ Brug automatik igen"):
+                if not chosen:
+                    st.warning("Vælg mindst én rettelse.")
+                else:
+                    try:
+                        for item in chosen:
+                            delete_habit_rule(item)
+                        st.success("Den manuelle rettelse er fjernet.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Kunne ikke nulstille: {e}")
+
+        else:
+            chosen = st.selectbox("Vælg rå bonvare", [""] + raw_names)
+            confirm = st.checkbox("Jeg forstår, at købshistorikken for denne vare slettes permanent.")
+            st.caption("Tilbudsavis-priser slettes ikke. Kun dine bonkøb og bonbaserede prisobservationer for varen.")
+            if st.button("🗑️ Slet permanent", type="primary"):
+                if not chosen or not confirm:
+                    st.warning("Vælg en vare og markér bekræftelsen.")
+                else:
+                    try:
+                        permanently_delete_raw_item(chosen)
+                        st.success("Varehistorikken er slettet permanent.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Kunne ikke slette: {e}")
 
         with st.expander("Se alle rå bonlinjer"):
             pdf = pd.DataFrame(history)
@@ -1176,4 +1359,4 @@ with tabs[6]:
     st.write("**Bon-OCR:**", "✅ aktiv" if ocr_key() else "⚠️ ikke aktiveret")
     st.caption("Netto+ og andre medlemsprogrammer er ikke datakilden. Gamle tilbud gemmes som tilbudshistorik og bruges aldrig som normalpris.")
 
-st.caption("Øko-robot v1.4 · smartere vaner + prisrobot")
+st.caption("Øko-robot v1.5 · manuelle vaner + sammenkædning")
