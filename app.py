@@ -115,6 +115,13 @@ def habit_summary(history):
     if df.empty or "item" not in df.columns:
         return pd.DataFrame()
 
+    # Ukendt butik er ikke gyldig data og vises derfor aldrig som en vane.
+    if "store" in df.columns:
+        store_clean = df["store"].fillna("").astype(str).str.strip().str.lower()
+        df = df[~store_clean.isin(["", "ukendt", "unknown", "none"])]
+    if df.empty:
+        return pd.DataFrame()
+
     rules = load_habit_rules()
     df["Grundvare"] = df["item"].map(lambda x: product_family(x, rules=rules))
     df = df[df["Grundvare"].notna() & (df["Grundvare"].astype(str).str.strip() != "")]
@@ -802,6 +809,17 @@ def save_receipt_price_observations(df, store):
     return save_price_observations(payload)
 
 
+
+def same_product_family(a, b):
+    """Sikker grundvare-match på tværs af bonnavne, OCR og manuelle regler."""
+    rules = load_habit_rules()
+    fa = product_family(a, rules=rules)
+    fb = product_family(b, rules=rules)
+    if not fa or not fb:
+        return False
+    return normalize(fa) == normalize(fb)
+
+
 def historical_best_price(query, organic_only=True):
     client = supabase_client()
     if not client:
@@ -833,13 +851,14 @@ def historical_best_price(query, organic_only=True):
             continue
         if organic_only and r.get("organic") is not True and not looks_organic(r.get("item", "")):
             continue
-        if match_score(query, r.get("item", "")) < 0.55:
+        if not same_product_family(query, r.get("item", "")) and match_score(query, r.get("item", "")) < 0.55:
             continue
         try:
             price = float(r.get("price"))
         except Exception:
             continue
-        if price <= 0 or not r.get("store"):
+        store_name = str(r.get("store") or "").strip()
+        if price <= 0 or store_name.lower() in ("", "ukendt", "unknown", "none"):
             continue
         candidates.append({
             "item": r.get("item", ""),
@@ -858,7 +877,7 @@ def historical_best_price(query, organic_only=True):
 
     for r in purchases:
         item_name = r.get("item", "")
-        if match_score(query, item_name) < 0.55:
+        if not same_product_family(query, item_name) and match_score(query, item_name) < 0.55:
             continue
         if organic_only and not looks_organic(item_name):
             continue
@@ -869,7 +888,8 @@ def historical_best_price(query, organic_only=True):
             price = float(raw_price)
         except Exception:
             continue
-        if price <= 0 or not r.get("store"):
+        store_name = str(r.get("store") or "").strip()
+        if price <= 0 or store_name.lower() in ("", "ukendt", "unknown", "none"):
             continue
         candidates.append({
             "item": item_name,
@@ -939,6 +959,9 @@ def save_purchase_history(df, store):
     client = supabase_client()
     if not client:
         raise RuntimeError("Supabase er ikke forbundet.")
+    valid_stores = {"Netto", "REMA 1000", "365discount", "Lidl", "føtex", "Nemlig.com"}
+    if store not in valid_stores:
+        raise ValueError("Vælg bonens butik før du gemmer. 'Ukendt' gemmes ikke længere.")
     payload = []
     for _, row in df.iterrows():
         name = str(row.get("Vare", "")).strip()
@@ -1211,7 +1234,9 @@ with tabs[4]:
     )
     store = st.selectbox(
         "Bonens butik",
-        ["", "Netto", "REMA 1000", "365discount", "Lidl", "føtex", "Nemlig.com"],
+        ["Netto", "REMA 1000", "365discount", "Lidl", "føtex", "Nemlig.com"],
+        index=None,
+        placeholder="Vælg butik",
     )
     if text:
         parsed = parse_receipt_smart(text)
@@ -1219,11 +1244,14 @@ with tabs[4]:
         if not parsed.empty:
             edited = st.data_editor(parsed, num_rows="dynamic", hide_index=True, use_container_width=True)
             if st.button("💾 Gem køb, priser og rabatter", type="primary", use_container_width=True):
-                try:
-                    n = save_purchase_history(edited, store)
-                    st.success(f"{n} køb gemt i Supabase. Robotten husker nu de faktiske priser.")
-                except Exception as e:
-                    st.error(f"Kunne ikke gemme: {e}")
+                if not store:
+                    st.warning("Vælg først hvilken butik bonen er fra.")
+                else:
+                    try:
+                        n = save_purchase_history(edited, store)
+                        st.success(f"{n} køb gemt i Supabase. Robotten husker nu de faktiske priser.")
+                    except Exception as e:
+                        st.error(f"Kunne ikke gemme: {e}")
         else:
             st.warning("Jeg kunne ikke finde sikre varelinjer endnu. Ret eventuelt bonteksten ovenfor og prøv igen.")
 
@@ -1359,4 +1387,4 @@ with tabs[6]:
     st.write("**Bon-OCR:**", "✅ aktiv" if ocr_key() else "⚠️ ikke aktiveret")
     st.caption("Netto+ og andre medlemsprogrammer er ikke datakilden. Gamle tilbud gemmes som tilbudshistorik og bruges aldrig som normalpris.")
 
-st.caption("Øko-robot v1.5 · manuelle vaner + sammenkædning")
+st.caption("Øko-robot v1.5.1 · butikskrav + bedre varematch")
