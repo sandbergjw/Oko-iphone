@@ -18,7 +18,7 @@ except Exception:
 
 st.set_page_config(page_title="Øko-robot", page_icon="🥬", layout="centered")
 st.title("🥬 Øko-robot")
-st.caption("v2.0.2 · producent-match fix")
+st.caption("v2.0.3 · Nemlig + varematch fix")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
@@ -591,8 +591,6 @@ ALIASES = {
 
 
 
-# Mærke-/producentord må aldrig alene få to forskellige varer til at matche.
-# Fx Naturli' falafler ≠ Naturli' havredrik og Løgismose yoghurt ≠ Løgismose skyr/salatost.
 MATCH_BRAND_WORDS = {
     "naturli", "naturlig", "løgismose", "loegismose",
     "arla", "engvang", "salling", "rema", "netto", "lidl",
@@ -601,9 +599,8 @@ MATCH_BRAND_WORDS = {
 
 def meaningful_match_tokens(text):
     n = normalize(text)
-    tokens = set(n.split())
     return {
-        t for t in tokens
+        t for t in n.split()
         if t not in MATCH_BRAND_WORDS
         and len(t) >= 3
         and not re.fullmatch(r"\d+(?:[.,]\d+)?", t)
@@ -666,8 +663,7 @@ def match_score(query, product, description=""):
     if not qa or not pa:
         return 0
 
-    shared = qa & pa
-    exact = len(shared) / len(qa | pa)
+    exact = len(qa & pa) / len(qa | pa)
     if exact > 0:
         return exact
 
@@ -811,7 +807,11 @@ def search_nemlig_products(query, limit=20):
         if not available:
             continue
 
-        on_discount = bool(item.get("DiscountItem") or item.get("IsDiscountItem"))
+        # Nemlig kan returnere DiscountItem som et objekt/metadata.
+        # Det er kun et tilbud, når API'et eksplicit siger True.
+        discount_item = item.get("DiscountItem")
+        is_discount_item = item.get("IsDiscountItem")
+        on_discount = (discount_item is True) or (is_discount_item is True)
         rows.append({
             "Butik": "Nemlig.com",
             "Vare": name,
@@ -1711,14 +1711,17 @@ with tabs[3]:
             for item, count in sorted(h.items(), key=lambda x: x[1], reverse=True):
                 candidates = []
                 for _, r in organic.iterrows():
-                    s = match_score(item, r["Vare"], r["Beskrivelse"])
-                    q_tokens = meaningful_match_tokens(item)
-                    p_tokens = meaningful_match_tokens(f"{r['Vare']} {r['Beskrivelse']}")
-                    shared_product_tokens = q_tokens & p_tokens
-                    # En stærk familie/alias-match må gerne gå igennem.
-                    # En svag match må derimod ikke bygge på producentnavnet alene.
-                    if s >= 0.4 and (s >= 0.9 or shared_product_tokens):
-                        candidates.append((s, r))
+                    # Til mig skal matche selve varen – ikke en bred avisbeskrivelse,
+                    # som kan omtale flere helt forskellige produkter.
+                    s = match_score(item, r["Vare"], "")
+                    q_family = product_family(item, rules=load_habit_rules())
+                    p_family = product_family(r["Vare"], rules=load_habit_rules())
+                    same_family = (
+                        q_family and p_family
+                        and normalize(q_family) == normalize(p_family)
+                    )
+                    if s >= 0.55 or same_family:
+                        candidates.append((max(s, 1.0 if same_family else s), r))
                 if candidates:
                     candidates.sort(key=lambda x: (-x[0], x[1]["Pris"]))
                     _, r = candidates[0]
@@ -1929,4 +1932,4 @@ with tabs[6]:
     st.write("**Bon-OCR:**", "✅ aktiv" if ocr_key() else "⚠️ ikke aktiveret")
     st.caption("Netto+ og andre medlemsprogrammer er ikke datakilden. Gamle tilbud gemmes som tilbudshistorik og bruges aldrig som normalpris.")
 
-st.caption("Øko-robot v2.0.2 · producent-match fix")
+st.caption("Øko-robot v2.0.3 · Nemlig + varematch fix")
