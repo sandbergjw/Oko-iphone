@@ -18,7 +18,7 @@ except Exception:
 
 st.set_page_config(page_title="Øko-robot", page_icon="🥬", layout="centered")
 st.title("🥬 Øko-robot")
-st.caption("v2.0.3 · Nemlig + varematch fix")
+st.caption("v2.0.4 · faste varer + skarpere match")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
@@ -901,10 +901,17 @@ def wishlist_match(data, items, organic_only=True, include_nemlig=True):
     rows = []
     for item in items:
         candidates = []
+        query_family = product_family(item, rules=load_habit_rules())
         for _, r in base.iterrows():
-            score = match_score(item, r["Vare"], r["Beskrivelse"])
-            if score >= 0.34:
-                candidates.append((score, r))
+            product_name = str(r["Vare"])
+            product_family_name = product_family(product_name, rules=load_habit_rules())
+            same_family = (
+                query_family and product_family_name
+                and normalize(query_family) == normalize(product_family_name)
+            )
+            score = match_score(item, product_name, "")
+            if same_family or score >= 0.55:
+                candidates.append((max(score, 1.0 if same_family else score), r))
 
         # Nemlig søges direkte på præcis den vare brugeren mangler.
         # Det er mere stabilt end at forsøge at scrape hele webshoppen.
@@ -916,9 +923,15 @@ def wishlist_match(data, items, organic_only=True, include_nemlig=True):
                 if not nemlig_df.empty:
                     save_nemlig_search_prices(nemlig_df)
                     for _, nr in nemlig_df.iterrows():
-                        score = match_score(item, nr["Vare"], nr["Beskrivelse"])
-                        if score >= 0.34:
-                            candidates.append((score, nr))
+                        product_name = str(nr["Vare"])
+                        product_family_name = product_family(product_name, rules=load_habit_rules())
+                        same_family = (
+                            query_family and product_family_name
+                            and normalize(query_family) == normalize(product_family_name)
+                        )
+                        score = match_score(item, product_name, "")
+                        if same_family or score >= 0.55:
+                            candidates.append((max(score, 1.0 if same_family else score), nr))
             except Exception:
                 pass
 
@@ -1599,6 +1612,28 @@ if "flyer_data" not in st.session_state:
 if "source_status" not in st.session_state:
     st.session_state["source_status"] = []
 
+def canonical_shopping_items():
+    """Faste grundvarer til Jeg mangler: standardlisten + synlige varer fra Vaner."""
+    defaults = [
+        "Græsk yoghurt", "Minimælk", "Bananer", "Æg", "Smør",
+        "Hakket oksekød", "Kærnemælk", "Sødmælk",
+    ]
+    items = list(defaults)
+    try:
+        summary = habit_summary(load_purchase_history())
+        if not summary.empty:
+            items.extend(summary["Vare"].dropna().astype(str).str.strip().tolist())
+    except Exception:
+        pass
+    seen, out = set(), []
+    for x in items:
+        key = normalize(x)
+        if key and key not in seen:
+            seen.add(key)
+            out.append(str(x).strip().capitalize())
+    return out
+
+
 tabs = st.tabs(["🏠", "📝 Jeg mangler", "📰 Aviser", "🎯 Til mig", "📸 Bon", "🧠 Vaner", "⚙️"])
 
 with tabs[0]:
@@ -1621,16 +1656,34 @@ with tabs[0]:
         st.success(f"{len(data)} avis-/tilbudsvarer fundet.")
 
 with tabs[1]:
-    st.subheader("Hvad vil du gerne købe?")
-    txt = st.text_area(
-        "Én varetype pr. linje",
-        "Græsk yoghurt\nMinimælk\nBananer\nÆg\nSmør\nHakket oksekød\nKærnemælk\nSødmælk",
-        height=190,
+    st.subheader("Hvad mangler du?")
+    shopping_options = canonical_shopping_items()
+    selected_items = st.multiselect(
+        "Vælg varer",
+        shopping_options,
+        placeholder="Tryk og vælg fra dine faste varer…",
+        help="Listen bruger faste grundvarenavne og suppleres automatisk med dine Vaner.",
     )
+    new_item = st.text_input(
+        "Mangler varen på listen?",
+        placeholder="Skriv fx Avocado",
+        help="Nye varer kan bruges med det samme. Når de bliver en vane, dukker de automatisk op på listen.",
+    )
+    if st.button("➕ Tilføj til denne søgning", use_container_width=True):
+        if new_item.strip():
+            st.session_state["extra_wishlist_item"] = new_item.strip().capitalize()
+            st.rerun()
+
+    extra_item = st.session_state.get("extra_wishlist_item", "")
+    wanted_items = list(selected_items)
+    if extra_item and normalize(extra_item) not in {normalize(x) for x in wanted_items}:
+        wanted_items.append(extra_item)
+        st.caption(f"Ekstra vare: **{extra_item}**")
+
     organic_only = st.toggle("Kun økologiske tilbud", value=True)
     include_nemlig_w = st.toggle("Tag Nemlig.com med", value=True, key="nemlig_w")
 
-    if st.button("Find bedste pris", type="primary"):
+    if st.button("Find bedste pris", type="primary", disabled=not wanted_items):
         data = st.session_state["flyer_data"]
         if data.empty:
             with st.spinner("Læser tilbudsaviserne først…"):
@@ -1640,7 +1693,7 @@ with tabs[1]:
 
         result = wishlist_match(
             data,
-            [x.strip() for x in txt.splitlines() if x.strip()],
+            wanted_items,
             organic_only=organic_only,
             include_nemlig=include_nemlig_w,
         )
@@ -1836,15 +1889,26 @@ with tabs[5]:
                 raw_names,
                 help="Vælger du flere, bliver de samlet under det samme navn.",
             )
-            target = st.text_input("Navnet de skal samles under", placeholder="fx Græsk yoghurt")
+            existing_targets = canonical_shopping_items()
+            target_choice = st.selectbox(
+                "Denne vare skal høre under…",
+                ["➕ Nyt grundvarenavn"] + existing_targets,
+                help="Vælg helst et eksisterende grundvarenavn. Så bruger Jeg mangler altid samme ord.",
+            )
+            custom_target = ""
+            if target_choice == "➕ Nyt grundvarenavn":
+                custom_target = st.text_input("Nyt grundvarenavn", placeholder="fx Græsk yoghurt")
+            target = custom_target.strip() if target_choice == "➕ Nyt grundvarenavn" else target_choice
+            if chosen and target:
+                st.caption(" → ".join([", ".join(chosen), target]))
             if st.button("💾 Gem sammenkædning", type="primary"):
-                if not chosen or not target.strip():
-                    st.warning("Vælg mindst én vare og skriv det nye navn.")
+                if not chosen or not str(target).strip():
+                    st.warning("Vælg mindst én vare og et grundvarenavn.")
                 else:
                     try:
                         for item in chosen:
                             save_habit_rule(item, target_name=target, hidden=False)
-                        st.success(f"{len(chosen)} varevariant(er) er nu samlet som “{target.strip()}”.")
+                        st.success(f"{len(chosen)} varevariant(er) er nu samlet som “{str(target).strip()}”.")
                         st.rerun()
                     except Exception as e:
                         st.error(f"Kunne ikke gemme rettelsen: {e}")
@@ -1932,4 +1996,4 @@ with tabs[6]:
     st.write("**Bon-OCR:**", "✅ aktiv" if ocr_key() else "⚠️ ikke aktiveret")
     st.caption("Netto+ og andre medlemsprogrammer er ikke datakilden. Gamle tilbud gemmes som tilbudshistorik og bruges aldrig som normalpris.")
 
-st.caption("Øko-robot v2.0.3 · Nemlig + varematch fix")
+st.caption("Øko-robot v2.0.4 · faste varer + skarpere match")
