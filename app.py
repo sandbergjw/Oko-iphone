@@ -18,7 +18,7 @@ except Exception:
 
 st.set_page_config(page_title="Øko-robot", page_icon="🥬", layout="centered")
 st.title("🥬 Øko-robot")
-st.caption("v2.0.4 · faste varer + skarpere match")
+st.caption("v2.0.5 · ryddelig kategorisering")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
@@ -1884,10 +1884,26 @@ with tabs[5]:
         )
 
         if mode == "Sammenkæd / omdøb":
+            # Vis kun varer, der endnu ikke er kategoriseret/skjult.
+            # Når en sammenkædning gemmes og siden genindlæses, forsvinder
+            # de valgte bon-varianter derfor fra arbejdslisten.
+            rules = load_habit_rules()
+            pending_names = []
+            for name in raw_names:
+                rule = rules.get(normalize(name), {})
+                already_handled = bool(rule.get("target_name")) or bool(rule.get("hidden"))
+                if not already_handled:
+                    pending_names.append(name)
+
+            if pending_names:
+                st.caption(f"{len(pending_names)} varevariant(er) mangler stadig at blive kategoriseret.")
+            else:
+                st.success("Alle varevarianter er kategoriseret ✅")
+
             chosen = st.multiselect(
                 "Vælg én eller flere bon-varianter",
-                raw_names,
-                help="Vælger du flere, bliver de samlet under det samme navn.",
+                pending_names,
+                help="Når du gemmer en kategori, forsvinder de valgte varianter fra denne liste.",
             )
             existing_targets = canonical_shopping_items()
             target_choice = st.selectbox(
