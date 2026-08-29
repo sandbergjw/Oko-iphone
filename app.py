@@ -2,7 +2,7 @@ import io
 import re
 import json
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -18,7 +18,7 @@ except Exception:
 
 st.set_page_config(page_title="Øko-robot", page_icon="🥬", layout="centered")
 st.title("🥬 Øko-robot")
-st.caption("v1.8 · Nemlig prisrobot")
+st.caption("v1.9 · direkte Nemlig-søgning")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
@@ -539,13 +539,7 @@ def fetch_all(include_nemlig=True):
         status.append(("365discount", 0, "Kunne ikke læse avis"))
 
     if include_nemlig:
-        try:
-            nemlig = scrape_nemlig_online()
-            status.append(("Nemlig.com", len(nemlig), "Online tilbud + priser"))
-            if not nemlig.empty:
-                frames.append(nemlig)
-        except Exception:
-            status.append(("Nemlig.com", 0, "Kunne ikke læse online priser"))
+        status.append(("Nemlig.com", 0, "Direkte produktsøgning ved behov"))
 
     data = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
         columns=["Butik", "Vare", "Beskrivelse", "Pris", "Øko", "Avis", "Side", "Kilde", "Type"]
@@ -654,7 +648,157 @@ def match_score(query, product, description=""):
     return 0
 
 
-def wishlist_match(data, items, organic_only=True):
+
+NEMLIG_API_BASE = "https://www.nemlig.com/webapi"
+NEMLIG_SEARCH_GATEWAY = "https://webapi.prod.knl.nemlig.it/searchgateway/api"
+
+
+@st.cache_data(ttl=3000, show_spinner=False)
+def nemlig_session_info():
+    """Hent anonym token + katalog-timestamp. Ingen Nemlig-login nødvendig."""
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1"
+        ),
+        "Referer": "https://www.nemlig.com/",
+        "version": "11.201.0",
+        "platform": "web",
+        "device-size": "mobile",
+    }
+    sess = requests.Session()
+    sess.headers.update(headers)
+
+    token_r = sess.get(f"{NEMLIG_API_BASE}/Token", timeout=20)
+    token_r.raise_for_status()
+    token = (token_r.json() or {}).get("access_token")
+    if not token:
+        raise RuntimeError("Nemlig gav ikke en anonym adgangstoken")
+
+    auth_headers = dict(headers)
+    auth_headers["Authorization"] = f"Bearer {token}"
+
+    settings_r = sess.get(
+        f"{NEMLIG_API_BASE}/v2/AppSettings/Website",
+        headers=auth_headers,
+        timeout=20,
+    )
+    settings_r.raise_for_status()
+    settings = settings_r.json() or {}
+
+    combined = settings.get("CombinedProductsAndSitecoreTimestamp")
+    if not combined:
+        raise RuntimeError("Nemlig gav ikke produkt-timestamp")
+
+    # Nemlig-shopper-projektet bruger en anonym standard-timeslot til søgning.
+    timeslot = (datetime.now() + timedelta(days=1)).strftime("%Y%m%d") + "15-60-240"
+
+    return {
+        "token": token,
+        "timestamp": combined,
+        "timeslot": timeslot,
+        "timeslot_id": 0,
+    }
+
+
+@st.cache_data(ttl=1200, show_spinner=False)
+def search_nemlig_products(query, limit=20):
+    """Direkte søgning i Nemligs produktkatalog via deres søge-gateway."""
+    info = nemlig_session_info()
+    headers = {
+        "X-Correlation-Id": str(uuid.uuid4()),
+        "Origin": "https://www.nemlig.com",
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1"
+        ),
+        "Referer": "https://www.nemlig.com/",
+        "Authorization": f"Bearer {info['token']}",
+    }
+    params = {
+        "query": query,
+        "take": int(limit),
+        "skip": 0,
+        "recipeCount": 0,
+        "timestamp": info["timestamp"],
+        "timeslotUtc": info["timeslot"],
+        "deliveryZoneId": 1,
+        "includeFavorites": "0",
+        "TimeSlotId": info["timeslot_id"],
+    }
+
+    r = requests.get(
+        f"{NEMLIG_SEARCH_GATEWAY}/search",
+        params=params,
+        headers=headers,
+        timeout=25,
+    )
+    r.raise_for_status()
+    data = r.json() or {}
+    products_data = data.get("Products", {})
+    if isinstance(products_data, dict):
+        products = products_data.get("Products", [])
+    elif isinstance(products_data, list):
+        products = products_data
+    else:
+        products = []
+
+    rows = []
+    for item in products[:limit]:
+        try:
+            price = float(item.get("Price"))
+        except Exception:
+            continue
+        if price <= 0:
+            continue
+
+        name = str(item.get("Name") or "").strip()
+        if not name:
+            continue
+        description = str(item.get("Description") or "").strip()
+        labels = item.get("Labels") or []
+        labels_text = " ".join(str(x) for x in labels)
+        organic = (
+            looks_organic(f"{name} {description} {labels_text}")
+            or any("øko" in str(x).lower() for x in labels)
+        )
+        availability = item.get("Availability") or {}
+        available = (
+            availability.get("IsDeliveryAvailable", True)
+            and availability.get("IsAvailableInStock", True)
+        )
+        if not available:
+            continue
+
+        on_discount = bool(item.get("DiscountItem") or item.get("IsDiscountItem"))
+        rows.append({
+            "Butik": "Nemlig.com",
+            "Vare": name,
+            "Beskrivelse": description,
+            "Pris": price,
+            "Øko": organic,
+            "Avis": "",
+            "Side": "",
+            "Kilde": "https://www.nemlig.com/",
+            "Type": "Online tilbud" if on_discount else "Online pris",
+        })
+
+    return pd.DataFrame(rows)
+
+
+def save_nemlig_search_prices(df):
+    """Gem direkte Nemlig-søgeresultater med korrekt pris-type."""
+    if df is None or df.empty:
+        return
+    try:
+        save_offer_snapshots(df)
+    except Exception:
+        pass
+
+def wishlist_match(data, items, organic_only=True, include_nemlig=True):
     base = data.copy()
     if organic_only:
         base = base[base["Øko"] == True]
@@ -663,9 +807,25 @@ def wishlist_match(data, items, organic_only=True):
     for item in items:
         candidates = []
         for _, r in base.iterrows():
-            s = match_score(item, r["Vare"], r["Beskrivelse"])
-            if s >= 0.34:
-                candidates.append((s, r))
+            score = match_score(item, r["Vare"], r["Beskrivelse"])
+            if score >= 0.34:
+                candidates.append((score, r))
+
+        # Nemlig søges direkte på præcis den vare brugeren mangler.
+        # Det er mere stabilt end at forsøge at scrape hele webshoppen.
+        if include_nemlig:
+            try:
+                nemlig_df = search_nemlig_products(item, limit=24)
+                if organic_only and not nemlig_df.empty:
+                    nemlig_df = nemlig_df[nemlig_df["Øko"] == True]
+                if not nemlig_df.empty:
+                    save_nemlig_search_prices(nemlig_df)
+                    for _, nr in nemlig_df.iterrows():
+                        score = match_score(item, nr["Vare"], nr["Beskrivelse"])
+                        if score >= 0.34:
+                            candidates.append((score, nr))
+            except Exception:
+                pass
 
         if candidates:
             # Først rigtige tilbud. Nemlig "Online pris" er en aktuel prisreference
@@ -1313,7 +1473,7 @@ with tabs[0]:
     st.success("Nu læser robotten tilbudsaviser og bygger sin egen prishukommelse")
     st.write(
         "Netto, REMA 1000, Lidl, føtex og 365discount behandles som **tilbudsaviser**. "
-        "Nemlig.com står separat som **online tilbud**, fordi Nemlig ikke har en klassisk ugeavis. "
+        "Nemlig.com søges **direkte i produktkataloget**, når du trykker “Find bedste pris”. "
         "Hver gang aviserne læses, gemmes de priser robotten faktisk har set."
     )
     a, b = st.columns(2)
@@ -1350,6 +1510,7 @@ with tabs[1]:
             data,
             [x.strip() for x in txt.splitlines() if x.strip()],
             organic_only=organic_only,
+            include_nemlig=include_nemlig_w,
         )
         st.dataframe(result, hide_index=True, use_container_width=True)
         st.markdown("### Prisrobotten siger")
@@ -1631,4 +1792,4 @@ with tabs[6]:
     st.write("**Bon-OCR:**", "✅ aktiv" if ocr_key() else "⚠️ ikke aktiveret")
     st.caption("Netto+ og andre medlemsprogrammer er ikke datakilden. Gamle tilbud gemmes som tilbudshistorik og bruges aldrig som normalpris.")
 
-st.caption("Øko-robot v1.8 · Nemlig prisrobot")
+st.caption("Øko-robot v1.9 · direkte Nemlig-søgning")
