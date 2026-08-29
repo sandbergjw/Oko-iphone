@@ -18,7 +18,7 @@ except Exception:
 
 st.set_page_config(page_title="Øko-robot", page_icon="🥬", layout="centered")
 st.title("🥬 Øko-robot")
-st.caption("v1.9 · direkte Nemlig-søgning")
+st.caption("v2.0.2 · producent-match fix")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
@@ -97,6 +97,11 @@ def product_family(text, rules=None):
         ("minimælk", ("minimælk", "minimaelk")),
         ("letmælk", ("letmælk", "letmaelk")),
         ("sødmælk", ("sødmælk", "soedmaelk")),
+        ("æbler", (
+            " æble ", " æbler ", "æble 4", "æbler 4",
+            "pink lady", "royal gala", "gala æble", "gala æbler",
+            "golden delicious", "granny smith", "jazz æble", "jazz æbler"
+        )),
         ("smørbar", ("smørbar", "smørbart", "blandingsprodukt", "smørblanding")),
         ("smør", (" smør ", "smør 200", "smør 250", "smør 500", "butter")),
         ("leverpostej", ("leverpostej", "leverpost")),
@@ -566,7 +571,8 @@ ALIASES = {
     "kylling": ["kylling", "kyllingebryst", "kyllingefilet", "kyllingeinderfilet"],
     "gulerødder": ["gulerod", "gulerødder"],
     "kartofler": ["kartoffel", "kartofler"],
-    "æbler": ["æble", "æbler"],
+    "æble": ["æble", "æbler", "pink lady", "royal gala", "golden delicious", "granny smith", "jazz æble"],
+    "æbler": ["æble", "æbler", "pink lady", "royal gala", "golden delicious", "granny smith", "jazz æble"],
     "yoghurt": ["yoghurt", "skyr"],
 
     "kærnemælk": ["kærnemælk", "kærnem", "kaernemaelk", "kaernem"],
@@ -584,10 +590,41 @@ ALIASES = {
 }
 
 
+
+# Mærke-/producentord må aldrig alene få to forskellige varer til at matche.
+# Fx Naturli' falafler ≠ Naturli' havredrik og Løgismose yoghurt ≠ Løgismose skyr/salatost.
+MATCH_BRAND_WORDS = {
+    "naturli", "naturlig", "løgismose", "loegismose",
+    "arla", "engvang", "salling", "rema", "netto", "lidl",
+    "365", "føtex", "foetex", "coop", "änglamark", "anglamark",
+}
+
+def meaningful_match_tokens(text):
+    n = normalize(text)
+    tokens = set(n.split())
+    return {
+        t for t in tokens
+        if t not in MATCH_BRAND_WORDS
+        and len(t) >= 3
+        and not re.fullmatch(r"\d+(?:[.,]\d+)?", t)
+        and t not in {"stk", "kg", "g", "l", "ml", "cl", "pak", "pk"}
+    }
+
 def match_score(query, product, description=""):
     q = normalize(query)
     p = normalize(f"{product} {description}")
     if not q or not p:
+        return 0
+
+    # "Æbler" betyder frisk frugt – ikke produkter med æble i navnet.
+    # Denne kontrol ligger før den generelle alias/familie-matchning.
+    apple_queries = {"æble", "æbler"}
+    apple_not_fruit = (
+        "nektar", "juice", "most", "mos", "puré", "pure",
+        "cider", "saft", "drik", "smoothie", "eddike",
+        "marmelade", "grød", "kompot"
+    )
+    if q in apple_queries and any(word in p for word in apple_not_fruit):
         return 0
 
     # Hvis både søgning og bon/avis kan reduceres til samme grundvare,
@@ -624,12 +661,13 @@ def match_score(query, product, description=""):
                     if min(len(a), len(pw)) >= 5:
                         return 0.95
 
-    qa = set(q.split())
-    pa = set(p.split())
+    qa = meaningful_match_tokens(q)
+    pa = meaningful_match_tokens(p)
     if not qa or not pa:
         return 0
 
-    exact = len(qa & pa) / len(qa | pa)
+    shared = qa & pa
+    exact = len(shared) / len(qa | pa)
     if exact > 0:
         return exact
 
@@ -798,6 +836,63 @@ def save_nemlig_search_prices(df):
     except Exception:
         pass
 
+
+def candidate_unit_info(row):
+    try:
+        price = float(row.get("Pris"))
+    except Exception:
+        return None, None
+    return unit_price(price, f"{row.get('Vare', '')} {row.get('Beskrivelse', '')}")
+
+
+def rank_current_candidates(candidates):
+    """Rangér sammenlignelige aktuelle varer på enhedspris før pakkepris."""
+    if not candidates:
+        return []
+    enriched = []
+    for score, row in candidates:
+        upr, unit = candidate_unit_info(row)
+        enriched.append((score, row, upr, unit))
+
+    # Hvis flere kandidater kan sammenlignes på samme enhed, brug den enhed med flest kandidater.
+    counts = {}
+    for _, _, upr, unit in enriched:
+        if upr is not None and unit in ("kg", "l", "stk"):
+            counts[unit] = counts.get(unit, 0) + 1
+    preferred = max(counts, key=counts.get) if counts else None
+
+    def key(x):
+        score, row, upr, unit = x
+        if preferred and unit == preferred and upr is not None:
+            return (0, float(upr), -float(score))
+        return (1, -float(score), float(row["Pris"]))
+
+    return sorted(enriched, key=key)
+
+
+def current_vs_history(current_row, hist):
+    """Returnér True hvis en frisk historisk pris reelt er billigere end aktuel online-normalpris."""
+    if not hist or hist.get("stale"):
+        return False
+    cu, cun = candidate_unit_info(current_row)
+    hu = hist.get("unit_price")
+    hun = hist.get("unit_name")
+    try:
+        if cu is not None and hu is not None and cun and cun == hun:
+            return float(hu) < float(cu) * 0.995
+    except Exception:
+        pass
+
+    # Kun sammenlign rå pakkepris hvis pakkestørrelsen kan læses og er den samme.
+    cq, ca, cb = quantity_info(f"{current_row.get('Vare','')} {current_row.get('Beskrivelse','')}")
+    hq, ha, hb = quantity_info(hist.get("item", ""))
+    if ca and ha and cb and cb == hb and abs(float(ca)-float(ha)) < 0.0001:
+        try:
+            return float(hist["price"]) < float(current_row["Pris"]) * 0.995
+        except Exception:
+            return False
+    return False
+
 def wishlist_match(data, items, organic_only=True, include_nemlig=True):
     base = data.copy()
     if organic_only:
@@ -828,41 +923,48 @@ def wishlist_match(data, items, organic_only=True, include_nemlig=True):
                 pass
 
         if candidates:
-            # Først rigtige tilbud. Nemlig "Online pris" er en aktuel prisreference
-            # og bruges kun hvis der ikke findes et aktuelt tilbud på varen.
+            # Rigtige tilbud har første prioritet. Inden for samme type vælger vi
+            # laveste kr/kg, kr/l eller kr/stk frem for den mindste pakkepris.
             offer_candidates = [
                 x for x in candidates
                 if str(x[1].get("Type", "")).strip().lower() != "online pris"
             ]
             pool = offer_candidates if offer_candidates else candidates
-            pool.sort(key=lambda x: (-x[0], x[1]["Pris"]))
-            _, r = pool[0]
-            upr, uunit = unit_price(
-                float(r["Pris"]),
-                f"{r.get('Vare', '')} {r.get('Beskrivelse', '')}"
-            )
-            enhed = f"{upr:.2f} kr/{uunit}" if upr is not None and uunit else ""
-            verdict, verdict_note = price_verdict(item, float(r["Pris"]))
-            rows.append({
-                "Du mangler": item,
-                "Butik": r["Butik"],
-                "Vare": r["Vare"],
-                "Pris": r["Pris"],
-                "Vurdering": verdict,
-                "Enhedspris": enhed,
-                "Prisgrundlag": r["Type"],
-                "Senest set": "Denne uge",
-                "Svar": (
-                    (
-                        f"Aktuel onlinepris hos {r['Butik']} til {float(r['Pris']):.2f} kr. "
-                        if str(r.get("Type", "")).strip().lower() == "online pris"
-                        else f"Aktuelt tilbud hos {r['Butik']} til {float(r['Pris']):.2f} kr. "
-                    )
-                    + f"{verdict} – {verdict_note}."
-                    + (f" ({enhed})" if enhed else "")
-                ),
-            })
-            continue
+            ranked_now = rank_current_candidates(pool)
+            _, r, upr, uunit = ranked_now[0]
+
+            # En almindelig Nemlig-onlinepris må ikke overtage en billigere,
+            # frisk bonpris fra fx Netto alene fordi Nemlig-pakken er mindre.
+            if not offer_candidates and str(r.get("Type", "")).strip().lower() == "online pris":
+                hist_compare = historical_best_price(item, organic_only=organic_only)
+                if current_vs_history(r, hist_compare):
+                    candidates = []
+                else:
+                    hist_compare = None
+
+            if candidates:
+                enhed = f"{upr:.2f} kr/{uunit}" if upr is not None and uunit else ""
+                verdict, verdict_note = price_verdict(item, float(r["Pris"]))
+                rows.append({
+                    "Du mangler": item,
+                    "Butik": r["Butik"],
+                    "Vare": r["Vare"],
+                    "Pris": r["Pris"],
+                    "Vurdering": verdict,
+                    "Enhedspris": enhed,
+                    "Prisgrundlag": r["Type"],
+                    "Senest set": "Denne uge",
+                    "Svar": (
+                        (
+                            f"Aktuel onlinepris hos {r['Butik']} til {float(r['Pris']):.2f} kr. "
+                            if str(r.get("Type", "")).strip().lower() == "online pris"
+                            else f"Aktuelt tilbud hos {r['Butik']} til {float(r['Pris']):.2f} kr. "
+                        )
+                        + f"{verdict} – {verdict_note}."
+                        + (f" ({enhed})" if enhed else "")
+                    ),
+                })
+                continue
 
         # Ingen aktuel avispris: brug kun en pris vi faktisk tidligere har observeret.
         hist = historical_best_price(item, organic_only=organic_only)
@@ -876,9 +978,12 @@ def wishlist_match(data, items, organic_only=True, include_nemlig=True):
                 shown_store = "Historik: " + str(hist["store"])
             else:
                 age_note = "Prisen er frisk." if hist.get("age", 999) <= 30 else f"Senest set for {hist.get('age')} dage siden."
+                unit_note = ""
+                if hist.get("unit_price") is not None and hist.get("unit_name"):
+                    unit_note = f" ({float(hist['unit_price']):.2f} kr/{hist['unit_name']})"
                 answer = (
-                    f"Desværre ingen tilbud lige nu. Ud fra priser set de seneste 60 dage plejer den "
-                    f"at være billigst hos {hist['store']} til ca. {hist['price']:.2f} kr. {age_note}"
+                    f"Desværre ingen billigere aktuelt tilbud/pris. Ud fra priser set de seneste 60 dage "
+                    f"plejer den at være billigst hos {hist['store']} til ca. {hist['price']:.2f} kr.{unit_note} {age_note}"
                 )
                 shown_store = hist["store"]
             hist_unit = ""
@@ -1222,31 +1327,58 @@ def historical_best_price(query, organic_only=True):
 
     usable = [r for r in candidates if r["age"] <= MAX_CURRENT_AGE_DAYS]
     if usable:
-        by_store = {}
+        # Når vi har kr/kg, kr/l eller kr/stk, er det dét der afgør billigste butik.
+        unit_groups = {}
         for r in usable:
+            try:
+                up = float(r.get("unit_price"))
+            except Exception:
+                up = None
+            un = str(r.get("unit_name") or "").strip()
+            if up and up > 0 and un in ("kg", "l", "stk"):
+                unit_groups.setdefault(un, []).append(r)
+
+        ranking_unit = None
+        ranking_rows = usable
+        if unit_groups:
+            # Vælg den enhed vi har mest sammenlignelig historik for.
+            ranking_unit = max(unit_groups, key=lambda u: len(unit_groups[u]))
+            ranking_rows = unit_groups[ranking_unit]
+
+        by_store = {}
+        for r in ranking_rows:
             by_store.setdefault(r["store"], []).append(r)
 
         ranked = []
         for store, rs in by_store.items():
-            vals = sorted(float(x["price"]) for x in rs)
+            if ranking_unit:
+                vals = sorted(float(x["unit_price"]) for x in rs if x.get("unit_price") is not None)
+            else:
+                vals = sorted(float(x["price"]) for x in rs)
+            if not vals:
+                continue
             n = len(vals)
-            median = vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2
+            median_basis = vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2
             latest = min(rs, key=lambda x: x["age"])
-            ranked.append((median, len(rs), latest))
+            # Vis den seneste observerede pakkepris, men rangér på enhedspris når muligt.
+            ranked.append((median_basis, len(rs), latest))
 
-        ranked.sort(key=lambda x: (x[0], -x[1]))
-        median, observations, latest = ranked[0]
-        freshness = "Frisk bonpris" if latest["age"] <= FRESH_AGE_DAYS else "Ældre bonpris"
-        return {
-            "store": latest["store"],
-            "item": latest["item"],
-            "price": round(median, 2),
-            "label": f"{freshness} ({observations} observationer)",
-            "date": latest.get("date", ""),
-            "observations": observations,
-            "stale": False,
-            "age": latest["age"],
-        }
+        if ranked:
+            ranked.sort(key=lambda x: (x[0], -x[1]))
+            median_basis, observations, latest = ranked[0]
+            freshness = "Frisk bonpris" if latest["age"] <= FRESH_AGE_DAYS else "Ældre bonpris"
+            return {
+                "store": latest["store"],
+                "item": latest["item"],
+                "price": round(float(latest["price"]), 2),
+                "unit_price": round(float(median_basis), 2) if ranking_unit else latest.get("unit_price"),
+                "unit_name": ranking_unit or latest.get("unit_name"),
+                "label": f"{freshness} ({observations} observationer)",
+                "date": latest.get("date", ""),
+                "observations": observations,
+                "stale": False,
+                "age": latest["age"],
+            }
 
     # Alt er ældre end 60 dage: vis kun som historisk information,
     # og brug det ikke til at kalde en butik aktuelt billigst.
@@ -1580,7 +1712,12 @@ with tabs[3]:
                 candidates = []
                 for _, r in organic.iterrows():
                     s = match_score(item, r["Vare"], r["Beskrivelse"])
-                    if s >= 0.4:
+                    q_tokens = meaningful_match_tokens(item)
+                    p_tokens = meaningful_match_tokens(f"{r['Vare']} {r['Beskrivelse']}")
+                    shared_product_tokens = q_tokens & p_tokens
+                    # En stærk familie/alias-match må gerne gå igennem.
+                    # En svag match må derimod ikke bygge på producentnavnet alene.
+                    if s >= 0.4 and (s >= 0.9 or shared_product_tokens):
                         candidates.append((s, r))
                 if candidates:
                     candidates.sort(key=lambda x: (-x[0], x[1]["Pris"]))
@@ -1792,4 +1929,4 @@ with tabs[6]:
     st.write("**Bon-OCR:**", "✅ aktiv" if ocr_key() else "⚠️ ikke aktiveret")
     st.caption("Netto+ og andre medlemsprogrammer er ikke datakilden. Gamle tilbud gemmes som tilbudshistorik og bruges aldrig som normalpris.")
 
-st.caption("Øko-robot v1.9 · direkte Nemlig-søgning")
+st.caption("Øko-robot v2.0.2 · producent-match fix")
