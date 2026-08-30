@@ -895,6 +895,14 @@ def current_vs_history(current_row, hist):
 
 def wishlist_match(data, items, organic_only=True, include_nemlig=True):
     base = data.copy()
+
+    # Kontakten "Tag Nemlig.com med" gælder ALT i denne søgning.
+    # Nemlig filtreres derfor væk, også hvis data allerede ligger i flyer_data.
+    if not include_nemlig and not base.empty and "Butik" in base.columns:
+        base = base[
+            base["Butik"].fillna("").astype(str).str.strip().str.lower() != "nemlig.com"
+        ].copy()
+
     if organic_only:
         base = base[base["Øko"] == True]
 
@@ -949,7 +957,7 @@ def wishlist_match(data, items, organic_only=True, include_nemlig=True):
             # En almindelig Nemlig-onlinepris må ikke overtage en billigere,
             # frisk bonpris fra fx Netto alene fordi Nemlig-pakken er mindre.
             if not offer_candidates and str(r.get("Type", "")).strip().lower() == "online pris":
-                hist_compare = historical_best_price(item, organic_only=organic_only)
+                hist_compare = historical_best_price(item, organic_only=organic_only, include_nemlig=include_nemlig)
                 if current_vs_history(r, hist_compare):
                     candidates = []
                 else:
@@ -980,7 +988,7 @@ def wishlist_match(data, items, organic_only=True, include_nemlig=True):
                 continue
 
         # Ingen aktuel avispris: brug kun en pris vi faktisk tidligere har observeret.
-        hist = historical_best_price(item, organic_only=organic_only)
+        hist = historical_best_price(item, organic_only=organic_only, include_nemlig=include_nemlig)
         if hist:
             if hist.get("stale"):
                 answer = (
@@ -1242,7 +1250,7 @@ def same_product_family(a, b):
     return normalize(fa) == normalize(fb)
 
 
-def historical_best_price(query, organic_only=True):
+def historical_best_price(query, organic_only=True, include_nemlig=True):
     client = supabase_client()
     if not client:
         return None
@@ -1286,6 +1294,8 @@ def historical_best_price(query, organic_only=True):
             continue
         store_name = str(r.get("store") or "").strip()
         if price <= 0 or store_name.lower() in ("", "ukendt", "unknown", "none"):
+            continue
+        if not include_nemlig and store_name.lower() == "nemlig.com":
             continue
         candidates.append({
             "item": r.get("item", ""),
@@ -1876,6 +1886,23 @@ with tabs[5]:
 
         raw_names = sorted({str(x.get("item", "")).strip() for x in history if str(x.get("item", "")).strip()})
 
+        # De gamle bonnavne slettes ikke; de ligger skjult bag brugerens kategorier.
+        rules_for_overview = load_habit_rules()
+        grouped_rules = {}
+        for raw_name in raw_names:
+            rule = rules_for_overview.get(normalize(raw_name), {})
+            target = str(rule.get("target_name") or "").strip()
+            if target and normalize(target) != normalize(raw_name):
+                grouped_rules.setdefault(target, []).append(raw_name)
+
+        if grouped_rules:
+            with st.expander("🗂 Se hvad der ligger i mine kategorier"):
+                for target in sorted(grouped_rules, key=normalize):
+                    variants = sorted(grouped_rules[target], key=normalize)
+                    st.markdown(f"**{target.capitalize()}** · {len(variants)} varenavn(e)")
+                    for variant in variants:
+                        st.caption(f"↳ {variant}")
+
         st.markdown("### ✏️ Ret vaner")
         mode = st.radio(
             "Hvad vil du gøre?",
@@ -2012,4 +2039,4 @@ with tabs[6]:
     st.write("**Bon-OCR:**", "✅ aktiv" if ocr_key() else "⚠️ ikke aktiveret")
     st.caption("Netto+ og andre medlemsprogrammer er ikke datakilden. Gamle tilbud gemmes som tilbudshistorik og bruges aldrig som normalpris.")
 
-st.caption("Øko-robot v2.0.4 · faste varer + skarpere match")
+st.caption("Øko-robot v2.0.6 · kategorier + Nemlig-kontakt fix")
