@@ -607,6 +607,64 @@ def meaningful_match_tokens(text):
         and t not in {"stk", "kg", "g", "l", "ml", "cl", "pak", "pk"}
     }
 
+
+MATCH_GENERIC_WORDS = {
+    "øko", "økologisk", "økologiske", "organic",
+    "brun", "brune", "grøn", "grønne", "rød", "røde", "hvid", "hvide",
+    "gul", "gule", "mild", "milde", "frisk", "friske",
+    "stor", "store", "lille", "små", "mini",
+}
+
+def core_product_tokens(text):
+    """Produktord som faktisk beskriver varen – ikke fx 'øko' eller farven 'brune'."""
+    return {
+        t for t in meaningful_match_tokens(text)
+        if t not in MATCH_GENERIC_WORDS
+    }
+
+
+def product_words_related(a, b):
+    """Forsigtig lighed mellem rigtige produktord."""
+    if a == b:
+        return True
+    if min(len(a), len(b)) < 5:
+        return False
+    if a.startswith(b) or b.startswith(a) or a in b or b in a:
+        return True
+
+    # Små bøjnings-/OCR-forskelle: fx falafel/falafler.
+    from difflib import SequenceMatcher
+    return SequenceMatcher(None, a, b).ratio() >= 0.80
+
+
+def has_core_product_overlap(query, product):
+    """Kræv mindst ét rigtigt produktord i fællesskab."""
+    qa = core_product_tokens(query)
+    pa = core_product_tokens(product)
+    if not qa or not pa:
+        return False
+    return any(product_words_related(qw, pw) for qw in qa for pw in pa)
+
+
+def safe_wishlist_product_match(query, product, query_family=None, product_family_name=None):
+    """Sikker match til Jeg mangler.
+    Manuel kategori må matche direkte. Ellers kræves et reelt produktord.
+    """
+    same_family = (
+        query_family and product_family_name
+        and normalize(query_family) == normalize(product_family_name)
+    )
+    if same_family:
+        return True, 1.0
+
+    if not has_core_product_overlap(query, product):
+        return False, 0.0
+
+    score = match_score(query, product, "")
+    # Core-ordet er den vigtigste sikkerhed; score bruges til rangering.
+    return True, max(score, 0.60)
+
+
 def match_score(query, product, description=""):
     q = normalize(query)
     p = normalize(f"{product} {description}")
@@ -911,13 +969,11 @@ def wishlist_match(data, items, organic_only=True, include_nemlig=True):
         for _, r in base.iterrows():
             product_name = str(r["Vare"])
             product_family_name = product_family(product_name, rules=load_habit_rules())
-            same_family = (
-                query_family and product_family_name
-                and normalize(query_family) == normalize(product_family_name)
+            ok, score = safe_wishlist_product_match(
+                item, product_name, query_family, product_family_name
             )
-            score = match_score(item, product_name, "")
-            if same_family or score >= 0.55:
-                candidates.append((max(score, 1.0 if same_family else score), r))
+            if ok:
+                candidates.append((score, r))
 
         # Nemlig søges direkte på præcis den vare brugeren mangler.
         # Det er mere stabilt end at forsøge at scrape hele webshoppen.
@@ -931,13 +987,11 @@ def wishlist_match(data, items, organic_only=True, include_nemlig=True):
                     for _, nr in nemlig_df.iterrows():
                         product_name = str(nr["Vare"])
                         product_family_name = product_family(product_name, rules=load_habit_rules())
-                        same_family = (
-                            query_family and product_family_name
-                            and normalize(query_family) == normalize(product_family_name)
+                        ok, score = safe_wishlist_product_match(
+                            item, product_name, query_family, product_family_name
                         )
-                        score = match_score(item, product_name, "")
-                        if same_family or score >= 0.55:
-                            candidates.append((max(score, 1.0 if same_family else score), nr))
+                        if ok:
+                            candidates.append((score, nr))
             except Exception:
                 pass
 
@@ -1623,26 +1677,45 @@ if "flyer_data" not in st.session_state:
 if "source_status" not in st.session_state:
     st.session_state["source_status"] = []
 
+def danish_sort_key(text):
+    """Dansk alfabetisk rækkefølge: ... z, æ, ø, å."""
+    t = str(text or "").strip().lower()
+    trans = str.maketrans({"æ": "{", "ø": "|", "å": "}"})
+    return t.translate(trans)
+
+
 def canonical_shopping_items():
-    """Faste grundvarer til Jeg mangler: standardlisten + synlige varer fra Vaner."""
-    defaults = [
-        "Græsk yoghurt", "Minimælk", "Bananer", "Æg", "Smør",
-        "Hakket oksekød", "Kærnemælk", "Sødmælk",
-    ]
-    items = list(defaults)
-    try:
-        summary = habit_summary(load_purchase_history())
-        if not summary.empty:
-            items.extend(summary["Vare"].dropna().astype(str).str.strip().tolist())
-    except Exception:
-        pass
+    """Jeg mangler viser brugerens egne kategorinavne – ikke gamle standardnavne."""
+    rules = load_habit_rules()
+    items = []
+
+    # Når brugeren har oprettet kategorier, er det KUN disse navne,
+    # der skal være faste valg i "Jeg mangler".
+    for rule in rules.values():
+        if rule.get("hidden"):
+            continue
+        target = str(rule.get("target_name") or "").strip()
+        if target:
+            items.append(target)
+
+    # Hvis der endnu ikke findes egne kategorier, falder vi tilbage på
+    # de aktive vane-familier. Der er ingen hardcoded standardliste længere.
+    if not items:
+        try:
+            summary = habit_summary(load_purchase_history())
+            if not summary.empty:
+                items.extend(summary["Vare"].dropna().astype(str).str.strip().tolist())
+        except Exception:
+            pass
+
     seen, out = set(), []
     for x in items:
         key = normalize(x)
         if key and key not in seen:
             seen.add(key)
             out.append(str(x).strip().capitalize())
-    return out
+
+    return sorted(out, key=danish_sort_key)
 
 
 tabs = st.tabs(["🏠", "📝 Jeg mangler", "📰 Aviser", "🎯 Til mig", "📸 Bon", "🧠 Vaner", "⚙️"])
@@ -1673,7 +1746,7 @@ with tabs[1]:
         "Vælg varer",
         shopping_options,
         placeholder="Tryk og vælg fra dine faste varer…",
-        help="Listen bruger faste grundvarenavne og suppleres automatisk med dine Vaner.",
+        help="Listen viser dine egne kategorinavne. Gamle standardnavne vises ikke længere.",
     )
     new_item = st.text_input(
         "Mangler varen på listen?",
@@ -1686,9 +1759,10 @@ with tabs[1]:
             st.rerun()
 
     extra_item = st.session_state.get("extra_wishlist_item", "")
-    wanted_items = list(selected_items)
+    wanted_items = sorted(list(selected_items), key=danish_sort_key)
     if extra_item and normalize(extra_item) not in {normalize(x) for x in wanted_items}:
         wanted_items.append(extra_item)
+        wanted_items = sorted(wanted_items, key=danish_sort_key)
         st.caption(f"Ekstra vare: **{extra_item}**")
 
     organic_only = st.toggle("Kun økologiske tilbud", value=True)
@@ -1708,6 +1782,12 @@ with tabs[1]:
             organic_only=organic_only,
             include_nemlig=include_nemlig_w,
         )
+        if not result.empty and "Du mangler" in result.columns:
+            result = result.sort_values(
+                "Du mangler",
+                key=lambda col: col.map(danish_sort_key),
+                kind="stable",
+            ).reset_index(drop=True)
         st.dataframe(result, hide_index=True, use_container_width=True)
         st.markdown("### Prisrobotten siger")
         for _, rr in result.iterrows():
@@ -2042,4 +2122,4 @@ with tabs[6]:
     st.write("**Bon-OCR:**", "✅ aktiv" if ocr_key() else "⚠️ ikke aktiveret")
     st.caption("Netto+ og andre medlemsprogrammer er ikke datakilden. Gamle tilbud gemmes som tilbudshistorik og bruges aldrig som normalpris.")
 
-st.caption("Øko-robot v2.0.6 · Nemlig-toggle + kategorioprydning")
+st.caption("Øko-robot v2.0.8 · sikkert produktmatch")
