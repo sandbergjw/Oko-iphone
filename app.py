@@ -896,8 +896,6 @@ def current_vs_history(current_row, hist):
 def wishlist_match(data, items, organic_only=True, include_nemlig=True):
     base = data.copy()
 
-    # Kontakten "Tag Nemlig.com med" gælder ALT i denne søgning.
-    # Nemlig filtreres derfor væk, også hvis data allerede ligger i flyer_data.
     if not include_nemlig and not base.empty and "Butik" in base.columns:
         base = base[
             base["Butik"].fillna("").astype(str).str.strip().str.lower() != "nemlig.com"
@@ -1330,6 +1328,9 @@ def historical_best_price(query, organic_only=True, include_nemlig=True):
         try:
             price = float(raw_price)
         except Exception:
+            continue
+        purchase_store = str(r.get("store") or "").strip()
+        if not include_nemlig and purchase_store.lower() == "nemlig.com":
             continue
         store_name = str(r.get("store") or "").strip()
         if price <= 0 or store_name.lower() in ("", "ukendt", "unknown", "none"):
@@ -1886,22 +1887,24 @@ with tabs[5]:
 
         raw_names = sorted({str(x.get("item", "")).strip() for x in history if str(x.get("item", "")).strip()})
 
-        # De gamle bonnavne slettes ikke; de ligger skjult bag brugerens kategorier.
-        rules_for_overview = load_habit_rules()
-        grouped_rules = {}
+        overview_rules = load_habit_rules()
+        category_members = {}
         for raw_name in raw_names:
-            rule = rules_for_overview.get(normalize(raw_name), {})
+            rule = overview_rules.get(normalize(raw_name), {})
+            if rule.get("hidden"):
+                continue
             target = str(rule.get("target_name") or "").strip()
             if target and normalize(target) != normalize(raw_name):
-                grouped_rules.setdefault(target, []).append(raw_name)
+                category_members.setdefault(target, []).append(raw_name)
 
-        if grouped_rules:
+        if category_members:
             with st.expander("🗂 Se hvad der ligger i mine kategorier"):
-                for target in sorted(grouped_rules, key=normalize):
-                    variants = sorted(grouped_rules[target], key=normalize)
-                    st.markdown(f"**{target.capitalize()}** · {len(variants)} varenavn(e)")
-                    for variant in variants:
-                        st.caption(f"↳ {variant}")
+                for target in sorted(category_members, key=normalize):
+                    members = sorted(category_members[target], key=normalize)
+                    st.markdown(f"**{target.capitalize()}**")
+                    st.caption(f"{len(members)} gammelt varenavn(e) ligger bag denne kategori")
+                    for member in members:
+                        st.write(f"↳ {member}")
 
         st.markdown("### ✏️ Ret vaner")
         mode = st.radio(
@@ -2039,4 +2042,4 @@ with tabs[6]:
     st.write("**Bon-OCR:**", "✅ aktiv" if ocr_key() else "⚠️ ikke aktiveret")
     st.caption("Netto+ og andre medlemsprogrammer er ikke datakilden. Gamle tilbud gemmes som tilbudshistorik og bruges aldrig som normalpris.")
 
-st.caption("Øko-robot v2.0.6 · kategorier + Nemlig-kontakt fix")
+st.caption("Øko-robot v2.0.6 · Nemlig-toggle + kategorioprydning")
