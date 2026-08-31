@@ -384,6 +384,54 @@ def _ocr_image_url(image_url):
     ).strip()
 
 
+
+OCR_WORD_FIXES = {
+    "ogo": "ØGO",
+    "0go": "ØGO",
+    "øgo": "ØGO",
+    "hamburgerryo": "hamburgerryg",
+    "hamburgerry0": "hamburgerryg",
+    "hamburgerrvg": "hamburgerryg",
+    "okologisk": "økologisk",
+    "økologlsk": "økologisk",
+    "okologiske": "økologiske",
+    "solsikkerugbrod": "solsikkerugbrød",
+    "rugbrod": "rugbrød",
+    "gulerodder": "gulerødder",
+    "maelk": "mælk",
+}
+
+def clean_flyer_ocr_text(text):
+    value = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not value:
+        return ""
+
+    tokens = value.split()
+    fixed = []
+    for token in tokens:
+        lead = re.match(r"^\W*", token).group(0)
+        tail = re.search(r"\W*$", token).group(0)
+        end = len(token) - len(tail) if tail else len(token)
+        core = token[len(lead):end]
+        replacement = OCR_WORD_FIXES.get(core.lower())
+        if replacement:
+            if core[:1].isupper() and replacement != "ØGO":
+                replacement = replacement.capitalize()
+            core = replacement
+        fixed.append(f"{lead}{core}{tail}")
+
+    value = " ".join(fixed)
+    value = re.sub(r"(?i)\b(?:O|0|Ø)\s*GO\b", "ØGO", value)
+    return value.strip()
+
+
+def clean_flyer_product_name(name):
+    name = clean_flyer_ocr_text(name)
+    name = re.sub(r"(?i)\b(?:aktuel|tilbudsavis|spot|spotvarer)\b", "", name)
+    name = re.sub(r"\s+", " ", name).strip(" -–·,.;:")
+    return name[:120]
+
+
 def _flyer_price_from_lines(lines, center, radius=5):
     """Find en sandsynlig tilbudspris tæt på en øko-produktlinje."""
     best = None
@@ -469,23 +517,29 @@ def _organic_offers_from_ocr(store, text, source_url, page_no):
     """Udtræk kun økologiske tilbud fra OCR-tekst med konservativ prisbinding."""
     if not text:
         return []
-    lines = [re.sub(r"\s+", " ", x).strip() for x in text.splitlines() if x.strip()]
+    lines = [clean_flyer_ocr_text(x) for x in text.splitlines() if str(x).strip()]
     rows = []
     seen = set()
 
     for i, line in enumerate(lines):
-        low = line.lower()
+        context = " ".join(lines[max(0, i-2):min(len(lines), i+3)])
+        low = context.lower()
         organic_hit = (
-            looks_organic(line)
+            looks_organic(context)
             or "økolog" in low
-            or bool(re.search(r"(^|\s)(?:ogo|0go)(?:\s|[.,;:()/-]|$)", low))
+            or bool(re.search(r"(^|\s)(?:ogo|0go|øgo)(?:\s|[.,;:()/-]|$)", low))
         )
         if not organic_hit:
             continue
 
-        price = _flyer_price_from_lines(lines, i)
-        name = _flyer_name_from_lines(lines, i)
+        price = _flyer_price_from_lines(lines, i, radius=6)
+        name = clean_flyer_product_name(_flyer_name_from_lines(lines, i, radius=5))
         if price is None or not name:
+            continue
+        low_name = normalize(name)
+        if low_name in {"øko", "økologisk", "øgo"}:
+            continue
+        if any(x in low_name for x in ["pr kunde pr dag", "spotvarer fås", "annonce"]):
             continue
 
         key = (normalize(name), round(price, 2), page_no)
@@ -2097,17 +2151,47 @@ with tabs[2]:
             default=["Netto", "REMA 1000", "365discount", "Lidl", "føtex"],
         )
         only_organic = st.toggle("Vis kun økologisk", value=True, key="only_org_flyer")
-        shown = data[data["Butik"].isin(stores)]
+        shown = data[data["Butik"].isin(stores)].copy()
         if only_organic:
             shown = shown[shown["Øko"] == True]
 
-        columns = ["Butik", "Vare", "Beskrivelse", "Pris", "Avis", "Side", "Type", "Kilde"]
-        st.dataframe(
-            shown[columns].sort_values(["Butik", "Pris"]),
-            hide_index=True,
-            use_container_width=True,
-            column_config={"Kilde": st.column_config.LinkColumn("Kilde", display_text="Åbn")},
-        )
+        if shown.empty:
+            st.info("Ingen varer fundet med de valgte filtre.")
+        else:
+            shown["Vare_vis"] = shown["Vare"].fillna("").map(clean_flyer_product_name)
+            shown["_Butik_sort"] = shown["Butik"].fillna("").map(danish_sort_key)
+            shown["_Vare_sort"] = shown["Vare_vis"].fillna("").map(danish_sort_key)
+            shown = shown.sort_values(["_Butik_sort", "_Vare_sort", "Pris"], kind="stable")
+
+            st.caption(f"{len(shown)} fundne tilbud")
+
+            for _, row in shown.iterrows():
+                store = str(row.get("Butik") or "")
+                product = str(row.get("Vare_vis") or row.get("Vare") or "").strip()
+                try:
+                    price_txt = f"{float(row.get('Pris')):.2f} kr.".replace(".00", "")
+                except Exception:
+                    price_txt = "Pris ukendt"
+
+                st.markdown(f"**{product or 'Ukendt vare'}**")
+                st.write(f"{store} · **{price_txt}**")
+
+                source_type = str(row.get("Type") or row.get("Avis") or "").strip()
+                page = str(row.get("Side") or "").strip()
+                meta = source_type + (f" · side {page}" if page else "")
+                if meta:
+                    st.caption(meta)
+                st.divider()
+
+            with st.expander("🔎 Se tekniske avisdetaljer"):
+                columns = ["Butik", "Vare_vis", "Pris", "Avis", "Side", "Type", "Kilde"]
+                detail = shown[[c for c in columns if c in shown.columns]].rename(columns={"Vare_vis": "Vare"})
+                st.dataframe(
+                    detail,
+                    hide_index=True,
+                    use_container_width=True,
+                    column_config={"Kilde": st.column_config.LinkColumn("Kilde", display_text="Åbn")},
+                )
 
 with tabs[3]:
     st.subheader("Tilbud på dine faste varer")
@@ -2446,4 +2530,4 @@ with tabs[6]:
     st.write("**Bon-OCR:**", "✅ aktiv" if ocr_key() else "⚠️ ikke aktiveret")
     st.caption("Netto+ og andre medlemsprogrammer er ikke datakilden. Gamle tilbud gemmes som tilbudshistorik og bruges aldrig som normalpris.")
 
-st.caption("Øko-robot v2.1.0 · dyb Netto-avis OCR")
+st.caption("Øko-robot v2.1.1 · OCR-oprydning + mobil avisvisning")
