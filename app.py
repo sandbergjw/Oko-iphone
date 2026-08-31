@@ -17,8 +17,8 @@ try:
 except Exception:
     create_client = None
 
-APP_VERSION = "2.1.4"
-APP_VERSION_TEXT = "feltopdelt avis-OCR + skarpere varenavne"
+APP_VERSION = "2.1.5"
+APP_VERSION_TEXT = "markørstyret avis-OCR + færre falske varer"
 
 st.set_page_config(page_title="Øko-robot", page_icon="🥬", layout="centered")
 st.title("🥬 Øko-robot")
@@ -432,23 +432,25 @@ def _download_flyer_image(image_url):
     return Image.open(io.BytesIO(r.content)).convert("RGB")
 
 
-def _flyer_quadrants(img, overlap=0.06):
-    """Fire overlappende felter. Holder varenavn og pris tættere sammen."""
+def _flyer_tiles(img, cols=3, rows=3, overlap=0.05):
+    """Små overlappende felter. Mindsker risikoen for at blande nabovarer."""
     w, h = img.size
+    tile_w = w / cols
+    tile_h = h / rows
     ox = int(w * overlap)
     oy = int(h * overlap)
-    boxes = [
-        (0, 0, min(w, w // 2 + ox), min(h, h // 2 + oy)),
-        (max(0, w // 2 - ox), 0, w, min(h, h // 2 + oy)),
-        (0, max(0, h // 2 - oy), min(w, w // 2 + ox), h),
-        (max(0, w // 2 - ox), max(0, h // 2 - oy), w, h),
-    ]
+
     out = []
-    for crop_box in boxes:
-        tile = img.crop(crop_box)
-        buf = io.BytesIO()
-        tile.save(buf, "JPEG", quality=90, optimize=True)
-        out.append(buf.getvalue())
+    for row in range(rows):
+        for col in range(cols):
+            x0 = max(0, int(col * tile_w) - ox)
+            y0 = max(0, int(row * tile_h) - oy)
+            x1 = min(w, int((col + 1) * tile_w) + ox)
+            y1 = min(h, int((row + 1) * tile_h) + oy)
+            tile = img.crop((x0, y0, x1, y1))
+            buf = io.BytesIO()
+            tile.save(buf, "JPEG", quality=90, optimize=True)
+            out.append(buf.getvalue())
     return out
 
 
@@ -664,52 +666,126 @@ def _flyer_name_from_lines(lines, center, radius=4):
 
 
 
+def _strict_organic_marker(line):
+    low = str(line or "").lower()
+    return (
+        "økolog" in low
+        or "okolog" in low
+        or "ekolog" in low
+        or bool(re.search(r"(^|\s)(?:øgo|ogo|0go)(?:\s|[.,;:()/-]|$)", low))
+    )
+
+
+def _nearest_price(lines, anchor, radius=4):
+    best = None
+    best_dist = 999
+    for i in range(max(0, anchor-radius), min(len(lines), anchor+radius+1)):
+        price = _flyer_price_from_lines(lines, i, radius=0)
+        if price is None:
+            continue
+        dist = abs(i-anchor)
+        if dist < best_dist:
+            best = price
+            best_dist = dist
+    return best, best_dist
+
+
+def _nearest_product_line(lines, anchor, radius=3):
+    candidates = []
+    for i in range(max(0, anchor-radius), min(len(lines), anchor+radius+1)):
+        raw = re.sub(r"\s+", " ", str(lines[i] or "")).strip()
+        if not raw:
+            continue
+
+        cleaned = clean_flyer_product_name(raw)
+        quality = flyer_name_quality(cleaned)
+        if quality < 2:
+            continue
+
+        n = normalize(cleaned)
+        if n in {"økologisk", "økologiske", "øko", "øgo", "ogo"}:
+            continue
+
+        dist = abs(i-anchor)
+        score = quality * 10 - dist
+        if i == anchor and len(cleaned.split()) >= 2:
+            score += 8
+        candidates.append((score, dist, raw, cleaned))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: (-x[0], x[1]))
+    return candidates[0]
+
+
 def _organic_offers_from_ocr(store, text, source_url, page_no):
-    """Udtræk øko-tilbud fra et lokalt OCR-felt."""
+    """Markørstyret udtræk: start kun fra en tydelig øko-linje."""
     if not text:
         return []
 
     lines = [clean_flyer_ocr_text(x) for x in text.splitlines() if str(x).strip()]
-    rows = []
-    seen = set()
+    candidates = []
 
-    for i, line in enumerate(lines):
-        # I et lille felt kan øko-logoet godt ligge 1 linje fra varenavnet.
-        near = " ".join(lines[max(0, i-1):min(len(lines), i+2)])
-        if not _organic_marker_in_text(near):
+    for marker_i, marker_line in enumerate(lines):
+        if not _strict_organic_marker(marker_line):
             continue
 
-        price = _flyer_price_from_lines(lines, i, radius=4)
+        product = _nearest_product_line(lines, marker_i, radius=3)
+        if not product:
+            continue
+        _, name_dist, raw_name, clean_name = product
+
+        price, price_dist = _nearest_price(lines, marker_i, radius=4)
         if price is None:
             continue
 
-        raw_name = _flyer_name_from_lines(lines, i, radius=3)
-        clean_name = clean_flyer_product_name(raw_name)
-        if not clean_name or flyer_name_quality(clean_name) < 2:
+        if name_dist > 2 and price_dist > 2:
             continue
 
-        key = (normalize(clean_name), round(float(price), 2), str(page_no))
-        if key in seen:
+        n = normalize(clean_name)
+        reject_exact = {
+            "100 bomuld", "100% bomuld", "ekstra", "ekstra jomfru",
+            "madlavning 4", "lavning", "urtekram", "valsemøllen",
+            "kærgården", "kaergården", "red bull",
+        }
+        if n in reject_exact:
             continue
-        seen.add(key)
 
-        rows.append({
+        confidence = 100 - (name_dist * 12) - (price_dist * 8)
+        if _strict_organic_marker(raw_name):
+            confidence += 15
+
+        candidates.append({
             "Butik": store,
             "Vare": clean_name,
             "Beskrivelse": raw_name,
             "Pris": float(price),
             "Øko": True,
-            "Avis": "Aktuel tilbudsavis · felt-OCR",
+            "Avis": "Aktuel tilbudsavis · markør-OCR",
             "Side": str(page_no),
             "Kilde": source_url,
-            "Type": "Tilbudsavis felt-OCR",
+            "Type": "Tilbudsavis markør-OCR",
+            "_confidence": confidence,
         })
 
+    if not candidates:
+        return []
+
+    best = {}
+    for row in candidates:
+        key = (normalize(row["Vare"]), row["Side"])
+        if key not in best or row["_confidence"] > best[key]["_confidence"]:
+            best[key] = row
+
+    rows = list(best.values())
+    for row in rows:
+        row.pop("_confidence", None)
     return rows
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
-def scrape_flyer_pages_ocr(store, overview_url, max_pages=40, pipeline_version="2.1.4"):
+def scrape_flyer_pages_ocr(store, overview_url, max_pages=40, pipeline_version="2.1.5"):
     """
     Grundig avis-scanning.
     Finder de faktiske avis-sidebilleder og OCR-læser øko-tilbud, som
@@ -776,8 +852,10 @@ def scrape_flyer_pages_ocr(store, overview_url, max_pages=40, pipeline_version="
                 # På øko-sider deles billedet i fire felter. Det holder varenavn
                 # og pris sammen og undgår tekst fra produkter på den anden side.
                 page_img = _download_flyer_image(image_url)
-                for tile_bytes in _flyer_quadrants(page_img):
+                for tile_bytes in _flyer_tiles(page_img, cols=3, rows=3, overlap=0.04):
                     tile_text = _ocr_image_bytes(tile_bytes)
+                    if not any(_strict_organic_marker(x) for x in tile_text.splitlines()):
+                        continue
                     all_rows.extend(
                         _organic_offers_from_ocr(
                             store, tile_text, detail_url, page_counter
@@ -793,10 +871,11 @@ def scrape_flyer_pages_ocr(store, overview_url, max_pages=40, pipeline_version="
         return pd.DataFrame()
 
     df = pd.DataFrame(all_rows)
-    return (
-        df.drop_duplicates(subset=["Butik", "Vare", "Pris", "Side"])
-        .reset_index(drop=True)
-    )
+    if df.empty:
+        return df
+    df["_name_norm"] = df["Vare"].map(normalize)
+    df = df.drop_duplicates(subset=["Butik", "_name_norm", "Side"], keep="first")
+    return df.drop(columns=["_name_norm"]).reset_index(drop=True)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
