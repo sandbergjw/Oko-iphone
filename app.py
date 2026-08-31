@@ -1955,48 +1955,126 @@ with tabs[5]:
         if summary.empty:
             st.info("Ingen synlige vaner endnu.")
         else:
-            st.caption("Samme grundvare samles automatisk. Dine manuelle rettelser har altid første prioritet.")
-            for _, r in summary.iterrows():
-                price = "–" if pd.isna(r["Typisk pris"]) else f'{r["Typisk pris"]:.2f} kr.'
-                low = "–" if pd.isna(r["Laveste"]) else f'{r["Laveste"]:.2f} kr.'
-                latest = "–" if pd.isna(r["Seneste pris"]) else f'{r["Seneste pris"]:.2f} kr.'
-                st.markdown(f"**{str(r['Vare']).capitalize()}** · {r['Vane']}")
-                st.write(f"{r['Butik']} · købt {int(r['Køb'])} gange · typisk {price}")
-                st.caption(f"Laveste {low} · seneste {latest} · sidst købt {r['Senest købt']}")
-                st.divider()
+            st.caption("Tryk på en vare for at se bonhistorik og rette kategorien.")
 
-        raw_names = sorted({str(x.get("item", "")).strip() for x in history if str(x.get("item", "")).strip()})
+            # Saml butikker under samme kategori, så én vare kun får ét foldbart kort.
+            summary = summary.sort_values("Vare", key=lambda c: c.map(danish_sort_key), kind="stable")
+            rules = load_habit_rules()
+            hist_df = pd.DataFrame(history)
+            hist_df["Grundvare"] = hist_df["item"].map(lambda x: product_family(x, rules=rules))
 
-        overview_rules = load_habit_rules()
-        category_members = {}
-        for raw_name in raw_names:
-            rule = overview_rules.get(normalize(raw_name), {})
-            if rule.get("hidden"):
-                continue
-            target = str(rule.get("target_name") or "").strip()
-            if target and normalize(target) != normalize(raw_name):
-                category_members.setdefault(target, []).append(raw_name)
+            for family, fam_rows in summary.groupby("Vare", sort=False):
+                total_buys = int(fam_rows["Køb"].sum())
+                habit_level = "Fast vane" if total_buys >= 4 else ("Mulig vane" if total_buys >= 2 else "Engangskøb")
 
-        if category_members:
-            with st.expander("🗂 Se hvad der ligger i mine kategorier"):
-                for target in sorted(category_members, key=normalize):
-                    members = sorted(category_members[target], key=normalize)
-                    st.markdown(f"**{target.capitalize()}**")
-                    st.caption(f"{len(members)} gammelt varenavn(e) ligger bag denne kategori")
-                    for member in members:
-                        st.write(f"↳ {member}")
+                prices = pd.to_numeric(fam_rows["Typisk pris"], errors="coerce").dropna()
+                typical = f"{float(prices.median()):.2f} kr." if not prices.empty else "–"
+                shops = ", ".join(sorted(
+                    {str(x).strip() for x in fam_rows["Butik"] if str(x).strip()},
+                    key=danish_sort_key
+                ))
 
-        st.markdown("### ✏️ Ret vaner")
+                with st.expander(f"{str(family).capitalize()} · {habit_level} · {total_buys} køb"):
+                    st.write(f"**Butik:** {shops or '–'}")
+                    st.write(f"**Typisk pris:** {typical}")
+
+                    family_history = hist_df[
+                        hist_df["Grundvare"].astype(str).map(normalize) == normalize(family)
+                    ].copy()
+
+                    if not family_history.empty:
+                        family_history["Dato_sort"] = pd.to_datetime(
+                            family_history.get("purchased_at"), errors="coerce"
+                        )
+                        family_history = family_history.sort_values("Dato_sort", ascending=False)
+
+                        st.markdown("#### 🧾 Bonhistorik")
+                        hist_show = pd.DataFrame({
+                            "Dato": family_history["Dato_sort"].dt.strftime("%d/%m/%Y"),
+                            "Butik": family_history.get("store"),
+                            "Bonlinje": family_history.get("item"),
+                            "Betalt": pd.to_numeric(family_history.get("paid_price"), errors="coerce"),
+                            "Normalpris": pd.to_numeric(family_history.get("normal_price"), errors="coerce"),
+                            "Rabat": pd.to_numeric(family_history.get("discount"), errors="coerce"),
+                        })
+                        st.dataframe(hist_show, hide_index=True, use_container_width=True)
+
+                        raw_variants = sorted(
+                            {str(x).strip() for x in family_history["item"] if str(x).strip()},
+                            key=danish_sort_key,
+                        )
+
+                        st.markdown("#### 🔗 Varenavne i kategorien")
+                        for raw in raw_variants:
+                            st.caption(f"↳ {raw}")
+
+                        st.markdown("#### ✏️ Ret kategorien")
+                        rename_key = "rename_" + re.sub(r"[^a-z0-9]+", "_", normalize(family))
+                        new_name = st.text_input(
+                            "Nyt kategorinavn",
+                            value=str(family).capitalize(),
+                            key=rename_key,
+                        )
+                        if st.button("💾 Omdøb kategori", key="save_" + rename_key):
+                            if not new_name.strip():
+                                st.warning("Skriv et kategorinavn.")
+                            else:
+                                try:
+                                    # Gem reglen på hver rå bonvariant, så historikken bevares,
+                                    # men alle varianter vises under det nye navn.
+                                    for raw in raw_variants:
+                                        save_habit_rule(raw, target_name=new_name.strip(), hidden=False)
+                                    st.success(f"Kategorien hedder nu “{new_name.strip()}”.")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Kunne ikke omdøbe kategorien: {e}")
+
+                        move_variant = st.selectbox(
+                            "Flyt en bonvariant",
+                            [""] + raw_variants,
+                            key="move_variant_" + rename_key,
+                            help="Brug dette hvis en bonlinje er havnet i den forkerte kategori.",
+                        )
+                        target_options = [
+                            x for x in canonical_shopping_items()
+                            if normalize(x) != normalize(family)
+                        ]
+                        move_target = st.selectbox(
+                            "Flyt til kategori",
+                            [""] + target_options + ["➕ Ny kategori"],
+                            key="move_target_" + rename_key,
+                        )
+                        custom_move = ""
+                        if move_target == "➕ Ny kategori":
+                            custom_move = st.text_input(
+                                "Navn på ny kategori",
+                                key="move_custom_" + rename_key,
+                            )
+                        final_target = custom_move.strip() if move_target == "➕ Ny kategori" else move_target
+                        if st.button("↗️ Flyt bonvariant", key="move_btn_" + rename_key):
+                            if not move_variant or not final_target:
+                                st.warning("Vælg både bonvariant og kategori.")
+                            else:
+                                try:
+                                    save_habit_rule(move_variant, target_name=final_target, hidden=False)
+                                    st.success(f"“{move_variant}” er flyttet til “{final_target}”.")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Kunne ikke flytte varen: {e}")
+
+        raw_names = sorted(
+            {str(x.get("item", "")).strip() for x in history if str(x.get("item", "")).strip()},
+            key=danish_sort_key,
+        )
+
+        st.markdown("### 🧹 Flere rettelser")
         mode = st.radio(
             "Hvad vil du gøre?",
-            ["Sammenkæd / omdøb", "Fjern fra vaner", "Fortryd manuel rettelse", "Slet varehistorik permanent"],
+            ["Kategorisér nye bonnavne", "Fjern fra vaner", "Fortryd manuel rettelse", "Slet varehistorik permanent"],
             horizontal=False,
         )
 
-        if mode == "Sammenkæd / omdøb":
-            # Vis kun varer, der endnu ikke er kategoriseret/skjult.
-            # Når en sammenkædning gemmes og siden genindlæses, forsvinder
-            # de valgte bon-varianter derfor fra arbejdslisten.
+        if mode == "Kategorisér nye bonnavne":
             rules = load_habit_rules()
             pending_names = []
             for name in raw_names:
@@ -2007,44 +2085,32 @@ with tabs[5]:
 
             if pending_names:
                 st.caption(f"{len(pending_names)} varevariant(er) mangler stadig at blive kategoriseret.")
+                chosen = st.multiselect("Vælg bonvarianter", pending_names)
+                existing_targets = canonical_shopping_items()
+                target_choice = st.selectbox(
+                    "Skal høre under…",
+                    ["➕ Nyt grundvarenavn"] + existing_targets,
+                )
+                custom_target = ""
+                if target_choice == "➕ Nyt grundvarenavn":
+                    custom_target = st.text_input("Nyt grundvarenavn", placeholder="fx Græsk yoghurt")
+                target = custom_target.strip() if target_choice == "➕ Nyt grundvarenavn" else target_choice
+                if st.button("💾 Gem kategori", type="primary"):
+                    if not chosen or not target:
+                        st.warning("Vælg mindst én bonvariant og en kategori.")
+                    else:
+                        try:
+                            for item in chosen:
+                                save_habit_rule(item, target_name=target, hidden=False)
+                            st.success("Kategorien er gemt.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Kunne ikke gemme: {e}")
             else:
-                st.success("Alle varevarianter er kategoriseret ✅")
-
-            chosen = st.multiselect(
-                "Vælg én eller flere bon-varianter",
-                pending_names,
-                help="Når du gemmer en kategori, forsvinder de valgte varianter fra denne liste.",
-            )
-            existing_targets = canonical_shopping_items()
-            target_choice = st.selectbox(
-                "Denne vare skal høre under…",
-                ["➕ Nyt grundvarenavn"] + existing_targets,
-                help="Vælg helst et eksisterende grundvarenavn. Så bruger Jeg mangler altid samme ord.",
-            )
-            custom_target = ""
-            if target_choice == "➕ Nyt grundvarenavn":
-                custom_target = st.text_input("Nyt grundvarenavn", placeholder="fx Græsk yoghurt")
-            target = custom_target.strip() if target_choice == "➕ Nyt grundvarenavn" else target_choice
-            if chosen and target:
-                st.caption(" → ".join([", ".join(chosen), target]))
-            if st.button("💾 Gem sammenkædning", type="primary"):
-                if not chosen or not str(target).strip():
-                    st.warning("Vælg mindst én vare og et grundvarenavn.")
-                else:
-                    try:
-                        for item in chosen:
-                            save_habit_rule(item, target_name=target, hidden=False)
-                        st.success(f"{len(chosen)} varevariant(er) er nu samlet som “{str(target).strip()}”.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Kunne ikke gemme rettelsen: {e}")
+                st.success("Alle bonvarianter er kategoriseret ✅")
 
         elif mode == "Fjern fra vaner":
-            chosen = st.multiselect(
-                "Vælg varer der ikke skal tælle som vaner",
-                raw_names,
-                help="Bon- og prisdata bevares. Varen skjules kun i Vaner.",
-            )
+            chosen = st.multiselect("Vælg varer der ikke skal tælle som vaner", raw_names)
             if st.button("🙈 Fjern fra Vaner", type="primary"):
                 if not chosen:
                     st.warning("Vælg mindst én vare.")
@@ -2052,16 +2118,17 @@ with tabs[5]:
                     try:
                         for item in chosen:
                             save_habit_rule(item, target_name=None, hidden=True)
-                        st.success("Varen er fjernet fra Vaner, men bonhistorikken er bevaret.")
+                        st.success("Varen er skjult i Vaner, men historikken er bevaret.")
                         st.rerun()
                     except Exception as e:
                         st.error(f"Kunne ikke gemme ændringen: {e}")
 
         elif mode == "Fortryd manuel rettelse":
             rules = load_habit_rules()
-            rule_names = sorted([
-                r.get("source_item") or key for key, r in rules.items()
-            ])
+            rule_names = sorted(
+                [r.get("source_item") or key for key, r in rules.items()],
+                key=danish_sort_key,
+            )
             chosen = st.multiselect("Vælg manuelle rettelser der skal nulstilles", rule_names)
             if st.button("↩️ Brug automatik igen"):
                 if not chosen:
@@ -2090,18 +2157,6 @@ with tabs[5]:
                     except Exception as e:
                         st.error(f"Kunne ikke slette: {e}")
 
-        with st.expander("Se alle rå bonlinjer"):
-            pdf = pd.DataFrame(history)
-            show = pd.DataFrame({
-                "Dato": pdf.get("purchased_at"),
-                "Butik": pdf.get("store"),
-                "Vare": pdf.get("item"),
-                "Normalpris": pdf.get("normal_price"),
-                "Rabat": pdf.get("discount"),
-                "Betalt": pdf.get("paid_price"),
-            })
-            st.dataframe(show, hide_index=True, use_container_width=True)
-
 with tabs[6]:
     st.subheader("Datakilder")
     status = st.session_state["source_status"]
@@ -2122,4 +2177,4 @@ with tabs[6]:
     st.write("**Bon-OCR:**", "✅ aktiv" if ocr_key() else "⚠️ ikke aktiveret")
     st.caption("Netto+ og andre medlemsprogrammer er ikke datakilden. Gamle tilbud gemmes som tilbudshistorik og bruges aldrig som normalpris.")
 
-st.caption("Øko-robot v2.0.8 · sikkert produktmatch")
+st.caption("Øko-robot v2.0.9 · foldbare vaner + bonhistorik")
