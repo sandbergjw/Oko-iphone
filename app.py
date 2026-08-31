@@ -17,8 +17,8 @@ try:
 except Exception:
     create_client = None
 
-APP_VERSION = "2.1.3"
-APP_VERSION_TEXT = "renere OCR-navne + versionsfix"
+APP_VERSION = "2.1.4"
+APP_VERSION_TEXT = "feltopdelt avis-OCR + skarpere varenavne"
 
 st.set_page_config(page_title="Øko-robot", page_icon="🥬", layout="centered")
 st.title("🥬 Øko-robot")
@@ -388,6 +388,70 @@ def _ocr_image_url(image_url):
 
 
 
+def _ocr_image_bytes(image_bytes):
+    """OCR.Space på et udsnit af en avisside."""
+    key = ocr_key()
+    if not key or not image_bytes:
+        return ""
+    r = requests.post(
+        "https://api.ocr.space/parse/image",
+        files={"file": ("flyer_tile.jpg", image_bytes, "image/jpeg")},
+        data={
+            "apikey": key,
+            "language": "auto",
+            "detectOrientation": "true",
+            "scale": "true",
+            "isTable": "false",
+            "OCREngine": "2",
+        },
+        timeout=70,
+    )
+    r.raise_for_status()
+    payload = r.json()
+    if payload.get("IsErroredOnProcessing"):
+        return ""
+    return "\n".join(
+        x.get("ParsedText", "") for x in payload.get("ParsedResults", [])
+    ).strip()
+
+
+def _organic_marker_in_text(text):
+    low = str(text or "").lower()
+    return (
+        looks_organic(text)
+        or "økolog" in low
+        or "okolog" in low
+        or "ekolog" in low
+        or bool(re.search(r"(^|\s)(?:øgo|ogo|0go)(?:\s|[.,;:()/-]|$)", low))
+    )
+
+
+def _download_flyer_image(image_url):
+    r = requests.get(image_url, headers=HEADERS, timeout=35)
+    r.raise_for_status()
+    return Image.open(io.BytesIO(r.content)).convert("RGB")
+
+
+def _flyer_quadrants(img, overlap=0.06):
+    """Fire overlappende felter. Holder varenavn og pris tættere sammen."""
+    w, h = img.size
+    ox = int(w * overlap)
+    oy = int(h * overlap)
+    boxes = [
+        (0, 0, min(w, w // 2 + ox), min(h, h // 2 + oy)),
+        (max(0, w // 2 - ox), 0, w, min(h, h // 2 + oy)),
+        (0, max(0, h // 2 - oy), min(w, w // 2 + ox), h),
+        (max(0, w // 2 - ox), max(0, h // 2 - oy), w, h),
+    ]
+    out = []
+    for crop_box in boxes:
+        tile = img.crop(crop_box)
+        buf = io.BytesIO()
+        tile.save(buf, "JPEG", quality=90, optimize=True)
+        out.append(buf.getvalue())
+    return out
+
+
 OCR_WORD_FIXES = {
     "ogo": "ØGO",
     "0go": "ØGO",
@@ -429,32 +493,26 @@ def clean_flyer_ocr_text(text):
 
 
 def clean_flyer_product_name(name):
-    """Lav et kort, læsbart produktnavn af OCR-teksten.
-    Rå OCR bevares stadig i data/tekniske detaljer.
-    """
+    """Lav et kort varenavn. Fjern logo-, mængde- og kampagnetekst."""
     name = clean_flyer_ocr_text(name)
 
-    # Logo-støj og gentagelser.
     name = re.sub(r"(?i)\bØGO\s+(?:ØGO|SØGO|OGO|0GO)\b", "ØGO", name)
     name = re.sub(r"(?i)\bØKO\s+ØKO\b", "ØKO", name)
 
-    # Fjern tydelig kampagne-/begrænsningstekst.
-    name = re.sub(r"(?i)\b(?:aktuel|tilbudsavis|spotvarer?)\b", "", name)
-    name = re.sub(r"(?i)\bpr\.?\s+kunde\s+pr\.?\s+dag\b.*$", "", name)
+    # OCR mister nogle gange starten af ordet økologisk.
+    name = re.sub(r"(?i)^\s*(?:øko(?:logisk(?:e)?)?|oko(?:logisk(?:e)?)?|ekologisk(?:e)?|logisk)\s*", "", name)
+    name = re.sub(r"(?i)^\s*(?:ØGO|OGO|0GO)\s*", "", name)
+
+    # Kampagne-/brugsfraser er ikke varenavne.
+    name = re.sub(r"(?i)\b(?:aktuel|tilbudsavis|spotvarer?|pr\.?\s+kunde\s+pr\.?\s+dag)\b.*$", "", name)
+    name = re.sub(r"(?i)\b(?:findes på køl|til denne pris|først til mølle)\b.*$", "", name)
     name = re.sub(r"(?i)\bkun\s+\d+\s+pr\.?\s+kunde\b.*$", "", name)
 
-    # Fjern øko-branding i VISNINGEN – øko-status ligger allerede separat.
-    name = re.sub(r"(?i)^\s*(?:ØGO|ØKO)\s*", "", name).strip()
-    name = re.sub(r"(?i)^\s*økologisk(?:e)?\s*", "", name).strip()
+    # OCR-fragment: "eller tomater" -> "tomater".
+    name = re.sub(r"(?i)^eller\s+", "", name)
 
-    # Typisk OCR hvor første del af "bønner, kikærter eller tomater" mangler.
-    # Vis den sikre vare-del i stedet for "eller tomater".
-    name = re.sub(r"(?i)^eller\s+", "", name).strip()
-
-    # Fjern gentaget "dansk/Danske".
+    # Gentagelser.
     name = re.sub(r"(?i)\bdansk\s+danske\b", "Danske", name)
-
-    # Fjern dobbeltord: "tomater tomater" -> "tomater".
     words = name.split()
     deduped = []
     for word in words:
@@ -465,44 +523,55 @@ def clean_flyer_product_name(name):
 
     name = re.sub(r"\s+", " ", name).strip(" -–·,.;:")
 
-    # Rene logo-/tekstfragmenter er ikke varenavne.
+    # Mængder alene er ikke produkter.
+    if re.fullmatch(r"(?i)\d+(?:[.,]\d+)?\s*(?:g|kg|ml|cl|l|stk)", name):
+        return ""
+    if re.fullmatch(r"(?i)\d+\s*[-–]\s*\d+\s*(?:g|kg|ml|cl|l|stk)", name):
+        return ""
+
     if normalize(name) in {
         "", "øgo", "øko", "ogo", "søgo", "sogo",
-        "pr kunde pr dag", "delikatess sport",
+        "sport", "spot", "delikatess", "delikatess sport",
     }:
         return ""
 
-    return name[:120]
+    return name[:100]
 
 
 def flyer_name_quality(name):
-    """Sortér åbenlyse OCR-fragmenter fra den normale avisvisning."""
+    """Kun produktlignende tekst får lov i den almindelige tilbudsliste."""
     n = normalize(name)
     if not n:
         return 0
 
     reject = [
-        "pr kunde pr dag",
-        "spotvarer fås",
-        "først til mølle",
-        "gode vaner",
-        "delikatess sport",
+        "pr kunde pr dag", "spotvarer fås", "først til mølle",
+        "gode vaner", "findes på køl", "til denne pris",
+        "red bull",  # ikke øko; typisk nabotekst fra forsiden
     ]
     if any(x in n for x in reject):
         return 0
 
-    # Meget typiske logo/OCR-rester.
-    if n in {"øgo øgo", "øgo søgo", "øgo", "øko", "søgo", "ogo"}:
+    if re.fullmatch(r"\d+(?:[.,]\d+)?\s*(g|kg|ml|cl|l|stk)", n):
+        return 0
+    if re.fullmatch(r"\d+\s*[-–]\s*\d+\s*(g|kg|ml|cl|l|stk)", n):
         return 0
 
     words = [w for w in re.findall(r"[a-zæøå0-9%]+", n) if len(w) >= 2]
     if not words:
         return 0
 
-    score = 1
-    if len(words) >= 2:
-        score += 1
-    if any(len(w) >= 5 for w in words):
+    # Tekst med kun generiske øko-/kampagneord er ikke nok.
+    generic = {
+        "øko", "økologisk", "økologiske", "spot", "sport",
+        "dansk", "danske", "findes", "køl", "denne", "pris",
+    }
+    product_words = [w for w in words if w not in generic and not re.fullmatch(r"\d+%?", w)]
+    if not product_words:
+        return 0
+
+    score = 2
+    if any(len(w) >= 5 for w in product_words):
         score += 1
     return score
 
@@ -552,105 +621,95 @@ def _flyer_price_from_lines(lines, center, radius=5):
 
 
 def _flyer_name_from_lines(lines, center, radius=4):
-    """Lav et brugbart varenavn/beskrivelse omkring øko-markøren."""
+    """Find den mest produktlignende linje tæt på øko-markøren."""
     lo = max(0, center - radius)
     hi = min(len(lines), center + radius + 1)
-    keep = []
-    skip_words = (
-        "spotvarer", "pr. kg", "pr kg", "pr. stk", "pr stk",
-        "pr. pose", "pr pose", "pr. bakke", "pr bakke",
-        "side ", "annonce", "netto.dk",
-    )
+    candidates = []
+
     for i in range(lo, hi):
         line = re.sub(r"\s+", " ", lines[i]).strip(" •|")
         low = line.lower()
-        if not line or len(line) > 130:
+        if not line or len(line) > 110:
             continue
         if not re.search(r"[a-zæøå]", low):
             continue
-        if any(x in low for x in skip_words):
+        if any(x in low for x in (
+            "spotvarer", "pr. kg", "pr kg", "pr. stk", "pr stk",
+            "pr. pose", "pr pose", "pr. bakke", "pr bakke",
+            "side ", "annonce", "netto.dk", "pr. liter", "pr liter",
+        )):
             continue
-        # rene mål/prislinjer skal ikke være varenavn
         if re.fullmatch(r"[\d\s.,:/%-]+(?:kg|g|l|ml|cl|stk)?", low):
             continue
-        keep.append(line)
 
-    # Prioritér linjer der faktisk nævner øko/økologisk/ØGO.
-    organic_lines = [x for x in keep if looks_organic(x)]
-    if organic_lines:
-        base = organic_lines[0]
-        # Tilføj højst én nabotekst, hvis øko-linjen er meget kort.
-        if len(base) < 22:
-            others = [x for x in keep if x != base]
-            if others:
-                base = f"{base} {others[0]}"
-        return base[:150]
+        cleaned = clean_flyer_product_name(line)
+        quality = flyer_name_quality(cleaned)
+        if quality <= 0:
+            continue
 
-    return (" ".join(keep[:2]))[:150]
+        # Nærhed til markøren vægter højt.
+        distance = abs(i - center)
+        score = quality * 10 - distance
+
+        # En linje med både øko-markør og et rigtigt produktord er stærk.
+        if _organic_marker_in_text(line):
+            score += 3
+        candidates.append((score, line))
+
+    if not candidates:
+        return ""
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1][:150]
+
 
 
 def _organic_offers_from_ocr(store, text, source_url, page_no):
-    """Udtræk kun økologiske tilbud fra OCR-tekst med konservativ prisbinding."""
+    """Udtræk øko-tilbud fra et lokalt OCR-felt."""
     if not text:
         return []
+
     lines = [clean_flyer_ocr_text(x) for x in text.splitlines() if str(x).strip()]
     rows = []
     seen = set()
 
     for i, line in enumerate(lines):
-        # Øko-markøren skal være på selve linjen. Det forhindrer, at et ØGO-logo
-        # fra varen ved siden af gør fx AMA madlavning til en økologisk vare.
-        low = line.lower()
-        organic_hit = (
-            looks_organic(line)
-            or "økolog" in low
-            or bool(re.search(r"(^|\s)(?:ogo|0go|øgo)(?:\s|[.,;:()/-]|$)", low))
-        )
-        if not organic_hit:
+        # I et lille felt kan øko-logoet godt ligge 1 linje fra varenavnet.
+        near = " ".join(lines[max(0, i-1):min(len(lines), i+2)])
+        if not _organic_marker_in_text(near):
             continue
 
-        price = _flyer_price_from_lines(lines, i, radius=5)
-        name = clean_flyer_product_name(_flyer_name_from_lines(lines, i, radius=3))
-
-        # Hvis OCR-linjen kun var logoet, prøv kun den nærmeste nabotekst.
-        if not name:
-            neighbor_candidates = []
-            for j in (i - 1, i + 1):
-                if 0 <= j < len(lines):
-                    candidate = clean_flyer_product_name(lines[j])
-                    if flyer_name_quality(candidate) >= 2:
-                        neighbor_candidates.append(candidate)
-            name = neighbor_candidates[0] if neighbor_candidates else ""
-        if price is None or not name:
-            continue
-        if flyer_name_quality(name) < 2:
+        price = _flyer_price_from_lines(lines, i, radius=4)
+        if price is None:
             continue
 
-        key = (normalize(name), round(price, 2), page_no)
-        if key in seen:
-            continue
-        seen.add(key)
         raw_name = _flyer_name_from_lines(lines, i, radius=3)
         clean_name = clean_flyer_product_name(raw_name)
         if not clean_name or flyer_name_quality(clean_name) < 2:
             continue
 
+        key = (normalize(clean_name), round(float(price), 2), str(page_no))
+        if key in seen:
+            continue
+        seen.add(key)
+
         rows.append({
             "Butik": store,
             "Vare": clean_name,
             "Beskrivelse": raw_name,
-            "Pris": price,
+            "Pris": float(price),
             "Øko": True,
-            "Avis": "Aktuel tilbudsavis · OCR",
+            "Avis": "Aktuel tilbudsavis · felt-OCR",
             "Side": str(page_no),
             "Kilde": source_url,
-            "Type": "Tilbudsavis OCR",
+            "Type": "Tilbudsavis felt-OCR",
         })
+
     return rows
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
-def scrape_flyer_pages_ocr(store, overview_url, max_pages=40, pipeline_version="2.1.3"):
+def scrape_flyer_pages_ocr(store, overview_url, max_pages=40, pipeline_version="2.1.4"):
     """
     Grundig avis-scanning.
     Finder de faktiske avis-sidebilleder og OCR-læser øko-tilbud, som
@@ -709,12 +768,21 @@ def scrape_flyer_pages_ocr(store, overview_url, max_pages=40, pipeline_version="
                 break
             page_counter += 1
             try:
-                text = _ocr_image_url(image_url)
-                all_rows.extend(
-                    _organic_offers_from_ocr(
-                        store, text, detail_url, page_counter
+                # Først en billig helside-læsning som filter.
+                page_text = _ocr_image_url(image_url)
+                if not _organic_marker_in_text(page_text):
+                    continue
+
+                # På øko-sider deles billedet i fire felter. Det holder varenavn
+                # og pris sammen og undgår tekst fra produkter på den anden side.
+                page_img = _download_flyer_image(image_url)
+                for tile_bytes in _flyer_quadrants(page_img):
+                    tile_text = _ocr_image_bytes(tile_bytes)
+                    all_rows.extend(
+                        _organic_offers_from_ocr(
+                            store, tile_text, detail_url, page_counter
+                        )
                     )
-                )
             except Exception:
                 continue
 
