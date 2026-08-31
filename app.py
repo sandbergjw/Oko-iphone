@@ -17,9 +17,12 @@ try:
 except Exception:
     create_client = None
 
+APP_VERSION = "2.1.3"
+APP_VERSION_TEXT = "renere OCR-navne + versionsfix"
+
 st.set_page_config(page_title="Øko-robot", page_icon="🥬", layout="centered")
 st.title("🥬 Øko-robot")
-st.caption("v2.0.5 · ryddelig kategorisering")
+st.caption(f"v{APP_VERSION} · {APP_VERSION_TEXT}")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
@@ -426,10 +429,83 @@ def clean_flyer_ocr_text(text):
 
 
 def clean_flyer_product_name(name):
+    """Lav et kort, læsbart produktnavn af OCR-teksten.
+    Rå OCR bevares stadig i data/tekniske detaljer.
+    """
     name = clean_flyer_ocr_text(name)
-    name = re.sub(r"(?i)\b(?:aktuel|tilbudsavis|spot|spotvarer)\b", "", name)
+
+    # Logo-støj og gentagelser.
+    name = re.sub(r"(?i)\bØGO\s+(?:ØGO|SØGO|OGO|0GO)\b", "ØGO", name)
+    name = re.sub(r"(?i)\bØKO\s+ØKO\b", "ØKO", name)
+
+    # Fjern tydelig kampagne-/begrænsningstekst.
+    name = re.sub(r"(?i)\b(?:aktuel|tilbudsavis|spotvarer?)\b", "", name)
+    name = re.sub(r"(?i)\bpr\.?\s+kunde\s+pr\.?\s+dag\b.*$", "", name)
+    name = re.sub(r"(?i)\bkun\s+\d+\s+pr\.?\s+kunde\b.*$", "", name)
+
+    # Fjern øko-branding i VISNINGEN – øko-status ligger allerede separat.
+    name = re.sub(r"(?i)^\s*(?:ØGO|ØKO)\s*", "", name).strip()
+    name = re.sub(r"(?i)^\s*økologisk(?:e)?\s*", "", name).strip()
+
+    # Typisk OCR hvor første del af "bønner, kikærter eller tomater" mangler.
+    # Vis den sikre vare-del i stedet for "eller tomater".
+    name = re.sub(r"(?i)^eller\s+", "", name).strip()
+
+    # Fjern gentaget "dansk/Danske".
+    name = re.sub(r"(?i)\bdansk\s+danske\b", "Danske", name)
+
+    # Fjern dobbeltord: "tomater tomater" -> "tomater".
+    words = name.split()
+    deduped = []
+    for word in words:
+        if deduped and normalize(deduped[-1]) == normalize(word):
+            continue
+        deduped.append(word)
+    name = " ".join(deduped)
+
     name = re.sub(r"\s+", " ", name).strip(" -–·,.;:")
+
+    # Rene logo-/tekstfragmenter er ikke varenavne.
+    if normalize(name) in {
+        "", "øgo", "øko", "ogo", "søgo", "sogo",
+        "pr kunde pr dag", "delikatess sport",
+    }:
+        return ""
+
     return name[:120]
+
+
+def flyer_name_quality(name):
+    """Sortér åbenlyse OCR-fragmenter fra den normale avisvisning."""
+    n = normalize(name)
+    if not n:
+        return 0
+
+    reject = [
+        "pr kunde pr dag",
+        "spotvarer fås",
+        "først til mølle",
+        "gode vaner",
+        "delikatess sport",
+    ]
+    if any(x in n for x in reject):
+        return 0
+
+    # Meget typiske logo/OCR-rester.
+    if n in {"øgo øgo", "øgo søgo", "øgo", "øko", "søgo", "ogo"}:
+        return 0
+
+    words = [w for w in re.findall(r"[a-zæøå0-9%]+", n) if len(w) >= 2]
+    if not words:
+        return 0
+
+    score = 1
+    if len(words) >= 2:
+        score += 1
+    if any(len(w) >= 5 for w in words):
+        score += 1
+    return score
+
 
 
 def _flyer_price_from_lines(lines, center, radius=5):
@@ -522,34 +598,47 @@ def _organic_offers_from_ocr(store, text, source_url, page_no):
     seen = set()
 
     for i, line in enumerate(lines):
-        context = " ".join(lines[max(0, i-2):min(len(lines), i+3)])
-        low = context.lower()
+        # Øko-markøren skal være på selve linjen. Det forhindrer, at et ØGO-logo
+        # fra varen ved siden af gør fx AMA madlavning til en økologisk vare.
+        low = line.lower()
         organic_hit = (
-            looks_organic(context)
+            looks_organic(line)
             or "økolog" in low
             or bool(re.search(r"(^|\s)(?:ogo|0go|øgo)(?:\s|[.,;:()/-]|$)", low))
         )
         if not organic_hit:
             continue
 
-        price = _flyer_price_from_lines(lines, i, radius=6)
-        name = clean_flyer_product_name(_flyer_name_from_lines(lines, i, radius=5))
+        price = _flyer_price_from_lines(lines, i, radius=5)
+        name = clean_flyer_product_name(_flyer_name_from_lines(lines, i, radius=3))
+
+        # Hvis OCR-linjen kun var logoet, prøv kun den nærmeste nabotekst.
+        if not name:
+            neighbor_candidates = []
+            for j in (i - 1, i + 1):
+                if 0 <= j < len(lines):
+                    candidate = clean_flyer_product_name(lines[j])
+                    if flyer_name_quality(candidate) >= 2:
+                        neighbor_candidates.append(candidate)
+            name = neighbor_candidates[0] if neighbor_candidates else ""
         if price is None or not name:
             continue
-        low_name = normalize(name)
-        if low_name in {"øko", "økologisk", "øgo"}:
-            continue
-        if any(x in low_name for x in ["pr kunde pr dag", "spotvarer fås", "annonce"]):
+        if flyer_name_quality(name) < 2:
             continue
 
         key = (normalize(name), round(price, 2), page_no)
         if key in seen:
             continue
         seen.add(key)
+        raw_name = _flyer_name_from_lines(lines, i, radius=3)
+        clean_name = clean_flyer_product_name(raw_name)
+        if not clean_name or flyer_name_quality(clean_name) < 2:
+            continue
+
         rows.append({
             "Butik": store,
-            "Vare": name,
-            "Beskrivelse": name,
+            "Vare": clean_name,
+            "Beskrivelse": raw_name,
             "Pris": price,
             "Øko": True,
             "Avis": "Aktuel tilbudsavis · OCR",
@@ -561,7 +650,7 @@ def _organic_offers_from_ocr(store, text, source_url, page_no):
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
-def scrape_flyer_pages_ocr(store, overview_url, max_pages=40):
+def scrape_flyer_pages_ocr(store, overview_url, max_pages=40, pipeline_version="2.1.3"):
     """
     Grundig avis-scanning.
     Finder de faktiske avis-sidebilleder og OCR-læser øko-tilbud, som
@@ -839,7 +928,7 @@ def fetch_all(include_nemlig=True):
             # fordi oversigtstabellen kun indeholder en lille del af varerne.
             if store == "Netto" and ocr_key():
                 try:
-                    deep = scrape_flyer_pages_ocr(store, url, max_pages=40)
+                    deep = scrape_flyer_pages_ocr(store, url, max_pages=40, pipeline_version=APP_VERSION)
                     if not deep.empty:
                         df = pd.concat([df, deep], ignore_index=True)
                         df = df.drop_duplicates(
@@ -2163,7 +2252,7 @@ with tabs[2]:
             shown["_Vare_sort"] = shown["Vare_vis"].fillna("").map(danish_sort_key)
             shown = shown.sort_values(["_Butik_sort", "_Vare_sort", "Pris"], kind="stable")
 
-            st.caption(f"{len(shown)} fundne tilbud")
+            st.caption(f"{len(shown)} fundne tilbud · parser v{APP_VERSION}")
 
             for _, row in shown.iterrows():
                 store = str(row.get("Butik") or "")
@@ -2173,10 +2262,16 @@ with tabs[2]:
                 except Exception:
                     price_txt = "Pris ukendt"
 
-                st.markdown(f"**{product or 'Ukendt vare'}**")
+                source_type = str(row.get("Type") or row.get("Avis") or "").strip()
+                is_ocr = "ocr" in source_type.lower()
+
+                title = product or "Ukendt vare"
+                if is_ocr:
+                    st.markdown(f"**{title}**")
+                else:
+                    st.markdown(f"**{title}**")
                 st.write(f"{store} · **{price_txt}**")
 
-                source_type = str(row.get("Type") or row.get("Avis") or "").strip()
                 page = str(row.get("Side") or "").strip()
                 meta = source_type + (f" · side {page}" if page else "")
                 if meta:
@@ -2530,4 +2625,4 @@ with tabs[6]:
     st.write("**Bon-OCR:**", "✅ aktiv" if ocr_key() else "⚠️ ikke aktiveret")
     st.caption("Netto+ og andre medlemsprogrammer er ikke datakilden. Gamle tilbud gemmes som tilbudshistorik og bruges aldrig som normalpris.")
 
-st.caption("Øko-robot v2.1.1 · OCR-oprydning + mobil avisvisning")
+st.caption(f"Øko-robot v{APP_VERSION} · {APP_VERSION_TEXT}")
