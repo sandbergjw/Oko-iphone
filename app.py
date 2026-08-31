@@ -9,6 +9,7 @@ import pandas as pd
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
+from urllib.parse import urljoin
 from PIL import Image
 
 try:
@@ -173,7 +174,7 @@ def looks_organic(text):
     # "ØKO ARLA..." og "O ARLA..." hvor Ø er læst som O.
     return (
         "økolog" in t
-        or bool(re.search(r"(^|\s)(?:øko|øgo)(?:\s|[.,;:()/-]|$)", t))
+        or bool(re.search(r"(^|\s)(?:øko|øgo|ogo|0go)(?:\s|[.,;:()/-]|$)", t))
         or "änglamark" in t
         or "salling øko" in t
         or "365 øko" in t
@@ -335,6 +336,256 @@ def save_habits(items, store):
             h[k] = h.get(k, 0) + 1
     LOCAL_HABITS.write_text(json.dumps(h, ensure_ascii=False, indent=2), encoding="utf-8")
     return len(items), "lokal fallback"
+
+
+
+def _flyer_image_url(img, base_url):
+    """Find det bedst mulige billede fra lazy-load/srcset."""
+    candidates = []
+    for attr in ("data-src", "data-lazy-src", "data-original", "src"):
+        val = img.get(attr)
+        if val:
+            candidates.append(str(val).strip())
+    for attr in ("data-srcset", "srcset"):
+        val = img.get(attr)
+        if val:
+            parts = [x.strip().split()[0] for x in str(val).split(",") if x.strip()]
+            candidates.extend(reversed(parts))
+    for val in candidates:
+        if val and not val.startswith("data:"):
+            return urljoin(base_url, val)
+    return ""
+
+
+def _ocr_image_url(image_url):
+    """OCR.Space på én avis-side. Bruger samme nøgle som bon-scanneren."""
+    key = ocr_key()
+    if not key or not image_url:
+        return ""
+    r = requests.post(
+        "https://api.ocr.space/parse/image",
+        data={
+            "apikey": key,
+            "url": image_url,
+            "language": "auto",
+            "detectOrientation": "true",
+            "scale": "true",
+            "isTable": "false",
+            "OCREngine": "2",
+        },
+        timeout=70,
+    )
+    r.raise_for_status()
+    payload = r.json()
+    if payload.get("IsErroredOnProcessing"):
+        return ""
+    return "\n".join(
+        x.get("ParsedText", "") for x in payload.get("ParsedResults", [])
+    ).strip()
+
+
+def _flyer_price_from_lines(lines, center, radius=5):
+    """Find en sandsynlig tilbudspris tæt på en øko-produktlinje."""
+    best = None
+    best_dist = 999
+    lo = max(0, center - radius)
+    hi = min(len(lines), center + radius + 1)
+
+    for i in range(lo, hi):
+        raw = re.sub(r"\s+", " ", lines[i]).strip()
+        low = raw.lower()
+
+        # Typiske avispriser: 15-, 15,-, 15.00, 15,00, "15 kr."
+        patterns = [
+            r"^\s*(\d{1,3})\s*[-–]\s*$",
+            r"^\s*(\d{1,3})\s*[,.:]\s*[-–]?\s*$",
+            r"^\s*(\d{1,3})[,.](\d{2})\s*(?:kr\.?)?\s*$",
+            r"(?:^|\s)(\d{1,3})[,.](\d{2})\s*kr\.?(?:\s|$)",
+            r"(?:^|\s)(\d{1,3})\s*kr\.?(?:\s|$)",
+        ]
+        value = None
+        for pat in patterns:
+            m = re.search(pat, low)
+            if not m:
+                continue
+            try:
+                whole = int(m.group(1))
+                decimals = int(m.group(2)) if m.lastindex and m.lastindex >= 2 and m.group(2) else 0
+                value = whole + decimals / 100
+            except Exception:
+                value = None
+            break
+
+        if value is None or value <= 0 or value > 500:
+            continue
+
+        dist = abs(i - center)
+        if dist < best_dist:
+            best = float(value)
+            best_dist = dist
+
+    return best
+
+
+def _flyer_name_from_lines(lines, center, radius=4):
+    """Lav et brugbart varenavn/beskrivelse omkring øko-markøren."""
+    lo = max(0, center - radius)
+    hi = min(len(lines), center + radius + 1)
+    keep = []
+    skip_words = (
+        "spotvarer", "pr. kg", "pr kg", "pr. stk", "pr stk",
+        "pr. pose", "pr pose", "pr. bakke", "pr bakke",
+        "side ", "annonce", "netto.dk",
+    )
+    for i in range(lo, hi):
+        line = re.sub(r"\s+", " ", lines[i]).strip(" •|")
+        low = line.lower()
+        if not line or len(line) > 130:
+            continue
+        if not re.search(r"[a-zæøå]", low):
+            continue
+        if any(x in low for x in skip_words):
+            continue
+        # rene mål/prislinjer skal ikke være varenavn
+        if re.fullmatch(r"[\d\s.,:/%-]+(?:kg|g|l|ml|cl|stk)?", low):
+            continue
+        keep.append(line)
+
+    # Prioritér linjer der faktisk nævner øko/økologisk/ØGO.
+    organic_lines = [x for x in keep if looks_organic(x)]
+    if organic_lines:
+        base = organic_lines[0]
+        # Tilføj højst én nabotekst, hvis øko-linjen er meget kort.
+        if len(base) < 22:
+            others = [x for x in keep if x != base]
+            if others:
+                base = f"{base} {others[0]}"
+        return base[:150]
+
+    return (" ".join(keep[:2]))[:150]
+
+
+def _organic_offers_from_ocr(store, text, source_url, page_no):
+    """Udtræk kun økologiske tilbud fra OCR-tekst med konservativ prisbinding."""
+    if not text:
+        return []
+    lines = [re.sub(r"\s+", " ", x).strip() for x in text.splitlines() if x.strip()]
+    rows = []
+    seen = set()
+
+    for i, line in enumerate(lines):
+        low = line.lower()
+        organic_hit = (
+            looks_organic(line)
+            or "økolog" in low
+            or bool(re.search(r"(^|\s)(?:ogo|0go)(?:\s|[.,;:()/-]|$)", low))
+        )
+        if not organic_hit:
+            continue
+
+        price = _flyer_price_from_lines(lines, i)
+        name = _flyer_name_from_lines(lines, i)
+        if price is None or not name:
+            continue
+
+        key = (normalize(name), round(price, 2), page_no)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append({
+            "Butik": store,
+            "Vare": name,
+            "Beskrivelse": name,
+            "Pris": price,
+            "Øko": True,
+            "Avis": "Aktuel tilbudsavis · OCR",
+            "Side": str(page_no),
+            "Kilde": source_url,
+            "Type": "Tilbudsavis OCR",
+        })
+    return rows
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def scrape_flyer_pages_ocr(store, overview_url, max_pages=40):
+    """
+    Grundig avis-scanning.
+    Finder de faktiske avis-sidebilleder og OCR-læser øko-tilbud, som
+    produkt-tabellen på oversigtssiden ikke har registreret.
+    """
+    if not ocr_key():
+        return pd.DataFrame()
+
+    r = requests.get(overview_url, headers=HEADERS, timeout=25)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    # Find aktuelle detail-links til avisviseren.
+    detail_urls = []
+    for a in soup.find_all("a", href=True):
+        href = str(a.get("href") or "")
+        txt = " ".join(a.stripped_strings).lower()
+        if "/avis-" in href or ("vis tilbudsavis" in txt and "tilbudsavis" in href):
+            u = urljoin(overview_url, href)
+            if u not in detail_urls:
+                detail_urls.append(u)
+
+    # Nogle sider bruger direkte tilbudsavis-link uden /avis- i synlig tekst.
+    if not detail_urls:
+        for a in soup.find_all("a", href=True):
+            href = str(a.get("href") or "")
+            if "tilbudsavis" in href and href.rstrip("/") != overview_url.rstrip("/"):
+                u = urljoin(overview_url, href)
+                if u not in detail_urls:
+                    detail_urls.append(u)
+
+    all_rows = []
+    page_counter = 0
+
+    # Højst to aktuelle avis-dele; Netto har typisk mad + nonfood.
+    for detail_url in detail_urls[:2]:
+        try:
+            dr = requests.get(detail_url, headers=HEADERS, timeout=25, allow_redirects=True)
+            dr.raise_for_status()
+            dsoup = BeautifulSoup(dr.text, "html.parser")
+        except Exception:
+            continue
+
+        images = []
+        for img in dsoup.find_all("img"):
+            alt = str(img.get("alt") or "")
+            low = alt.lower()
+            if "tilbud" not in low or "side" not in low:
+                continue
+            image_url = _flyer_image_url(img, dr.url)
+            if image_url and image_url not in images:
+                images.append(image_url)
+
+        for image_url in images:
+            if page_counter >= max_pages:
+                break
+            page_counter += 1
+            try:
+                text = _ocr_image_url(image_url)
+                all_rows.extend(
+                    _organic_offers_from_ocr(
+                        store, text, detail_url, page_counter
+                    )
+                )
+            except Exception:
+                continue
+
+        if page_counter >= max_pages:
+            break
+
+    if not all_rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_rows)
+    return (
+        df.drop_duplicates(subset=["Butik", "Vare", "Pris", "Side"])
+        .reset_index(drop=True)
+    )
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -529,7 +780,24 @@ def fetch_all(include_nemlig=True):
     for store, url in FLYER_SOURCES.items():
         try:
             df = scrape_flyer_table(store, url)
-            status.append((store, len(df), "Tilbudsavis"))
+
+            # Pilot: Netto får en ekstra dyb OCR-scanning af selve avis-siderne,
+            # fordi oversigtstabellen kun indeholder en lille del af varerne.
+            if store == "Netto" and ocr_key():
+                try:
+                    deep = scrape_flyer_pages_ocr(store, url, max_pages=40)
+                    if not deep.empty:
+                        df = pd.concat([df, deep], ignore_index=True)
+                        df = df.drop_duplicates(
+                            subset=["Butik", "Vare", "Pris"],
+                            keep="first",
+                        ).reset_index(drop=True)
+                    status.append((store, len(df), "Tilbudsavis + dyb OCR"))
+                except Exception:
+                    status.append((store, len(df), "Tilbudsavis · OCR kunne ikke supplere"))
+            else:
+                status.append((store, len(df), "Tilbudsavis"))
+
             if not df.empty:
                 frames.append(df)
         except Exception:
@@ -1812,8 +2080,9 @@ with tabs[1]:
 
 with tabs[2]:
     st.subheader("Ugens tilbudsaviser")
+    st.caption("Netto læses nu i to lag: produktlisten + en grundig OCR-scanning af selve avis-siderne. Første opdatering kan derfor tage lidt længere tid.")
     if st.button("Opdater aviser"):
-        with st.spinner("Læser aviser…"):
+        with st.spinner("Læser aviser… Netto-scanningen kan tage et par minutter første gang."):
             data, status = fetch_all(include_nemlig=True)
         st.session_state["flyer_data"] = data
         st.session_state["source_status"] = status
@@ -2177,4 +2446,4 @@ with tabs[6]:
     st.write("**Bon-OCR:**", "✅ aktiv" if ocr_key() else "⚠️ ikke aktiveret")
     st.caption("Netto+ og andre medlemsprogrammer er ikke datakilden. Gamle tilbud gemmes som tilbudshistorik og bruges aldrig som normalpris.")
 
-st.caption("Øko-robot v2.0.9 · foldbare vaner + bonhistorik")
+st.caption("Øko-robot v2.1.0 · dyb Netto-avis OCR")
