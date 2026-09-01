@@ -17,8 +17,8 @@ try:
 except Exception:
     create_client = None
 
-APP_VERSION = "2.1.5"
-APP_VERSION_TEXT = "markørstyret avis-OCR + færre falske varer"
+APP_VERSION = "2.1.6"
+APP_VERSION_TEXT = "produktblokke + sikkerhedsscore"
 
 st.set_page_config(page_title="Øko-robot", page_icon="🥬", layout="centered")
 st.title("🥬 Øko-robot")
@@ -719,73 +719,132 @@ def _nearest_product_line(lines, anchor, radius=3):
     return candidates[0]
 
 
+
+def _looks_like_truncated_word(text):
+    raw = str(text or "").strip()
+    n = normalize(raw)
+    words = re.findall(r"[a-zæøå]+", n)
+    if not words:
+        return True
+    if words[0] in {"jisk", "akologisk", "ekologisk", "logisk"}:
+        return True
+    if len(words) == 1 and len(words[0]) <= 3:
+        return True
+    if raw.isupper() and len("".join(words)) <= 5:
+        return True
+    return False
+
+
+def _product_block_candidate(lines, marker_i, radius=3):
+    """Find ét produktnavn helt tæt på en tydelig øko-markør."""
+    candidates = []
+    for i in range(max(0, marker_i-radius), min(len(lines), marker_i+radius+1)):
+        raw = re.sub(r"\s+", " ", str(lines[i] or "")).strip()
+        cleaned = clean_flyer_product_name(raw)
+        if not cleaned or flyer_name_quality(cleaned) < 2:
+            continue
+        if _looks_like_truncated_word(cleaned):
+            continue
+
+        n = normalize(cleaned)
+        if n in {
+            "økologisk", "økologiske", "øko", "øgo", "ogo",
+            "ekstra", "ekstra jomfru", "kærgården", "kaergården",
+            "urtekram", "valsemøllen", "hindrer",
+        }:
+            continue
+
+        dist = abs(i - marker_i)
+        score = 72 - dist * 10
+        if i == marker_i:
+            score += 15
+        if _strict_organic_marker(raw):
+            score += 8
+        meaningful = [w for w in re.findall(r"[a-zæøå]+", n) if len(w) >= 4]
+        score += min(15, len(meaningful) * 4)
+        candidates.append((score, dist, raw, cleaned))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: (-x[0], x[1]))
+    return candidates[0]
+
+
+def _confidence_label(score):
+    if score >= 82:
+        return "Høj"
+    if score >= 68:
+        return "Mellem"
+    return "Lav"
+
+
 def _organic_offers_from_ocr(store, text, source_url, page_no):
-    """Markørstyret udtræk: start kun fra en tydelig øko-linje."""
+    """Produktblok-baseret OCR med sikkerhedsscore."""
     if not text:
         return []
 
     lines = [clean_flyer_ocr_text(x) for x in text.splitlines() if str(x).strip()]
-    candidates = []
+    rows = []
 
     for marker_i, marker_line in enumerate(lines):
         if not _strict_organic_marker(marker_line):
             continue
 
-        product = _nearest_product_line(lines, marker_i, radius=3)
+        product = _product_block_candidate(lines, marker_i, radius=3)
         if not product:
             continue
-        _, name_dist, raw_name, clean_name = product
 
-        price, price_dist = _nearest_price(lines, marker_i, radius=4)
+        name_score, name_dist, raw_name, clean_name = product
+        price, price_dist = _nearest_price(lines, marker_i, radius=3)
         if price is None:
             continue
 
-        if name_dist > 2 and price_dist > 2:
+        if name_dist > 2 or price_dist > 3:
             continue
 
         n = normalize(clean_name)
-        reject_exact = {
-            "100 bomuld", "100% bomuld", "ekstra", "ekstra jomfru",
-            "madlavning 4", "lavning", "urtekram", "valsemøllen",
-            "kærgården", "kaergården", "red bull",
-        }
-        if n in reject_exact:
+        reject_phrases = [
+            "100 bomuld", "til denne pris", "findes på køl",
+            "pr kunde", "spotvarer", "hindrer",
+        ]
+        if any(x in n for x in reject_phrases):
             continue
 
-        confidence = 100 - (name_dist * 12) - (price_dist * 8)
+        score = name_score - price_dist * 8
         if _strict_organic_marker(raw_name):
-            confidence += 15
+            score += 10
 
-        candidates.append({
+        rows.append({
             "Butik": store,
             "Vare": clean_name,
             "Beskrivelse": raw_name,
             "Pris": float(price),
             "Øko": True,
-            "Avis": "Aktuel tilbudsavis · markør-OCR",
+            "Avis": "Aktuel tilbudsavis · produktblok-OCR",
             "Side": str(page_no),
             "Kilde": source_url,
-            "Type": "Tilbudsavis markør-OCR",
-            "_confidence": confidence,
+            "Type": "Tilbudsavis produktblok-OCR",
+            "Sikkerhed": _confidence_label(score),
+            "_score": score,
         })
 
-    if not candidates:
+    if not rows:
         return []
 
     best = {}
-    for row in candidates:
+    for row in rows:
         key = (normalize(row["Vare"]), row["Side"])
-        if key not in best or row["_confidence"] > best[key]["_confidence"]:
+        if key not in best or row["_score"] > best[key]["_score"]:
             best[key] = row
 
-    rows = list(best.values())
-    for row in rows:
-        row.pop("_confidence", None)
-    return rows
+    result = list(best.values())
+    for row in result:
+        row.pop("_score", None)
+    return result
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
-def scrape_flyer_pages_ocr(store, overview_url, max_pages=40, pipeline_version="2.1.5"):
+def scrape_flyer_pages_ocr(store, overview_url, max_pages=40, pipeline_version="2.1.6"):
     """
     Grundig avis-scanning.
     Finder de faktiske avis-sidebilleder og OCR-læser øko-tilbud, som
@@ -1077,7 +1136,11 @@ def fetch_all(include_nemlig=True):
                 try:
                     deep = scrape_flyer_pages_ocr(store, url, max_pages=40, pipeline_version=APP_VERSION)
                     if not deep.empty:
-                        df = pd.concat([df, deep], ignore_index=True)
+                        if "Sikkerhed" in deep.columns:
+                            deep_for_robot = deep[deep["Sikkerhed"].eq("Høj")].copy()
+                        else:
+                            deep_for_robot = deep.copy()
+                        df = pd.concat([df, deep_for_robot], ignore_index=True)
                         df = df.drop_duplicates(
                             subset=["Butik", "Vare", "Pris"],
                             keep="first",
@@ -2399,9 +2462,14 @@ with tabs[2]:
             shown["_Vare_sort"] = shown["Vare_vis"].fillna("").map(danish_sort_key)
             shown = shown.sort_values(["_Butik_sort", "_Vare_sort", "Pris"], kind="stable")
 
-            st.caption(f"{len(shown)} fundne tilbud · parser v{APP_VERSION}")
+            if "Sikkerhed" not in shown.columns:
+                shown["Sikkerhed"] = ""
+            trusted = shown[~shown["Sikkerhed"].isin(["Mellem", "Lav"])].copy()
+            possible = shown[shown["Sikkerhed"].isin(["Mellem", "Lav"])].copy()
 
-            for _, row in shown.iterrows():
+            st.caption(f"{len(trusted)} sikre tilbud · {len(possible)} mulige fund · parser v{APP_VERSION}")
+
+            for _, row in trusted.iterrows():
                 store = str(row.get("Butik") or "")
                 product = str(row.get("Vare_vis") or row.get("Vare") or "").strip()
                 try:
@@ -2410,20 +2478,25 @@ with tabs[2]:
                     price_txt = "Pris ukendt"
 
                 source_type = str(row.get("Type") or row.get("Avis") or "").strip()
-                is_ocr = "ocr" in source_type.lower()
-
-                title = product or "Ukendt vare"
-                if is_ocr:
-                    st.markdown(f"**{title}**")
-                else:
-                    st.markdown(f"**{title}**")
+                st.markdown(f"**{product or 'Ukendt vare'}**")
                 st.write(f"{store} · **{price_txt}**")
-
                 page = str(row.get("Side") or "").strip()
                 meta = source_type + (f" · side {page}" if page else "")
                 if meta:
                     st.caption(meta)
                 st.divider()
+
+            if not possible.empty:
+                with st.expander(f"🟡 Mulige OCR-fund ({len(possible)})"):
+                    st.caption("Disse er for usikre til at påvirke Prisrobotten.")
+                    for _, row in possible.iterrows():
+                        product = str(row.get("Vare_vis") or row.get("Vare") or "").strip()
+                        store = str(row.get("Butik") or "")
+                        try:
+                            price_txt = f"{float(row.get('Pris')):.2f} kr.".replace(".00", "")
+                        except Exception:
+                            price_txt = "Pris ukendt"
+                        st.write(f"**{product}** · {store} · {price_txt} · {row.get('Sikkerhed', '')}")
 
             with st.expander("🔎 Se tekniske avisdetaljer"):
                 columns = ["Butik", "Vare_vis", "Pris", "Avis", "Side", "Type", "Kilde"]
