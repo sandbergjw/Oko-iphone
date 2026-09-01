@@ -18,8 +18,8 @@ try:
 except Exception:
     create_client = None
 
-APP_VERSION = "2.2.1"
-APP_VERSION_TEXT = "unikke Vaner-nøgler + bon-fix"
+APP_VERSION = "2.2.2"
+APP_VERSION_TEXT = "Vaner-key fix v2"
 
 st.set_page_config(page_title="Øko-robot", page_icon="🥬", layout="centered")
 st.title("🥬 Øko-robot")
@@ -2695,7 +2695,7 @@ with tabs[5]:
             hist_df = pd.DataFrame(history)
             hist_df["Grundvare"] = hist_df["item"].map(lambda x: product_family(x, rules=rules))
 
-            for family, fam_rows in summary.groupby("Vare", sort=False):
+            for family_idx, (family, fam_rows) in enumerate(summary.groupby("Vare", sort=False)):
                 total_buys = int(fam_rows["Køb"].sum())
                 habit_level = "Fast vane" if total_buys >= 4 else ("Mulig vane" if total_buys >= 2 else "Engangskøb")
 
@@ -2744,7 +2744,8 @@ with tabs[5]:
                         family_norm = normalize(family)
                         family_slug = re.sub(r"[^a-z0-9]+", "_", family_norm).strip("_") or "vare"
                         family_hash = hashlib.sha1(family_norm.encode("utf-8")).hexdigest()[:10]
-                        rename_key = f"rename_{family_slug}_{family_hash}"
+                        # family_idx guarantees uniqueness even if two categories normalize identically.
+                        rename_key = f"rename_{family_idx}_{family_slug}_{family_hash}"
                         new_name = st.text_input(
                             "Nyt kategorinavn",
                             value=str(family).capitalize(),
