@@ -17,8 +17,8 @@ try:
 except Exception:
     create_client = None
 
-APP_VERSION = "2.1.6"
-APP_VERSION_TEXT = "produktblokke + sikkerhedsscore"
+APP_VERSION = "2.1.7"
+APP_VERSION_TEXT = "flere avisfund + sikker prisrobot"
 
 st.set_page_config(page_title="Øko-robot", page_icon="🥬", layout="centered")
 st.title("🥬 Øko-robot")
@@ -771,9 +771,10 @@ def _product_block_candidate(lines, marker_i, radius=3):
 
 
 def _confidence_label(score):
-    if score >= 82:
+    # Lidt mindre stramt end v2.1.6, så reelle varer ikke forsvinder.
+    if score >= 74:
         return "Høj"
-    if score >= 68:
+    if score >= 60:
         return "Mellem"
     return "Lav"
 
@@ -844,7 +845,7 @@ def _organic_offers_from_ocr(store, text, source_url, page_no):
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
-def scrape_flyer_pages_ocr(store, overview_url, max_pages=40, pipeline_version="2.1.6"):
+def scrape_flyer_pages_ocr(store, overview_url, max_pages=40, pipeline_version="2.1.7"):
     """
     Grundig avis-scanning.
     Finder de faktiske avis-sidebilleder og OCR-læser øko-tilbud, som
@@ -1136,13 +1137,11 @@ def fetch_all(include_nemlig=True):
                 try:
                     deep = scrape_flyer_pages_ocr(store, url, max_pages=40, pipeline_version=APP_VERSION)
                     if not deep.empty:
-                        if "Sikkerhed" in deep.columns:
-                            deep_for_robot = deep[deep["Sikkerhed"].eq("Høj")].copy()
-                        else:
-                            deep_for_robot = deep.copy()
-                        df = pd.concat([df, deep_for_robot], ignore_index=True)
+                        # Behold ALLE OCR-fund til Aviser-fanen.
+                        # Usikre fund filtreres først fra, når Prisrobotten matcher.
+                        df = pd.concat([df, deep], ignore_index=True)
                         df = df.drop_duplicates(
-                            subset=["Butik", "Vare", "Pris"],
+                            subset=["Butik", "Vare", "Pris", "Side"],
                             keep="first",
                         ).reset_index(drop=True)
                     status.append((store, len(df), "Tilbudsavis + dyb OCR"))
@@ -1574,6 +1573,11 @@ def current_vs_history(current_row, hist):
 
 def wishlist_match(data, items, organic_only=True, include_nemlig=True):
     base = data.copy()
+
+    # Aviser må gerne vise tvivlsomme OCR-fund, men de må ikke styre Prisrobotten.
+    if not base.empty and "Sikkerhed" in base.columns:
+        ocr_mask = base.get("Type", pd.Series(index=base.index, dtype=str)).fillna("").astype(str).str.contains("OCR", case=False, na=False)
+        base = base[(~ocr_mask) | base["Sikkerhed"].fillna("").eq("Høj")].copy()
 
     if not include_nemlig and not base.empty and "Butik" in base.columns:
         base = base[
@@ -2467,7 +2471,7 @@ with tabs[2]:
             trusted = shown[~shown["Sikkerhed"].isin(["Mellem", "Lav"])].copy()
             possible = shown[shown["Sikkerhed"].isin(["Mellem", "Lav"])].copy()
 
-            st.caption(f"{len(trusted)} sikre tilbud · {len(possible)} mulige fund · parser v{APP_VERSION}")
+            st.caption(f"{len(trusted)} sikre tilbud · {len(possible)} mulige OCR-fund · parser v{APP_VERSION}")
 
             for _, row in trusted.iterrows():
                 store = str(row.get("Butik") or "")
