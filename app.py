@@ -4,6 +4,7 @@ import json
 import uuid
 from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
+import hashlib
 
 import pandas as pd
 import requests
@@ -17,8 +18,8 @@ try:
 except Exception:
     create_client = None
 
-APP_VERSION = "2.1.7"
-APP_VERSION_TEXT = "flere avisfund + sikker prisrobot"
+APP_VERSION = "2.2.1"
+APP_VERSION_TEXT = "unikke Vaner-nøgler + bon-fix"
 
 st.set_page_config(page_title="Øko-robot", page_icon="🥬", layout="centered")
 st.title("🥬 Øko-robot")
@@ -940,55 +941,154 @@ def scrape_flyer_pages_ocr(store, overview_url, max_pages=40, pipeline_version="
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def scrape_flyer_table(store, url):
-    """Læs den aktuelle tilbudsavis' produkt-tabel."""
+    """
+    Læs produktlisten fra tilbudsavissidens STRUKTUREREDE tabel.
+    OCR bruges ikke her. Tabellen har allerede produkt, beskrivelse, side og pris,
+    men HTML'en bruger rowspans, så nogle rækker har færre celler end andre.
+    """
     r = requests.get(url, headers=HEADERS, timeout=25)
     r.raise_for_status()
 
-    # Pandas finder tabellen "Produkter i ... tilbudsaviser".
-    tables = pd.read_html(io.StringIO(r.text))
     rows = []
+    seen = set()
+    soup = BeautifulSoup(r.text, "html.parser")
 
-    for table in tables:
-        cols = [str(c).strip().lower() for c in table.columns]
-        table.columns = cols
+    current_flyer = ""
+    current_page = ""
 
-        # Vi kræver produkt/beskrivelse + pris for ikke at tage irrelevante tabeller.
-        product_col = next((c for c in cols if "produkt" in c), None)
-        desc_col = next((c for c in cols if "beskrivelse" in c), None)
-        price_col = next((c for c in cols if "pris" in c), None)
-        flyer_col = next((c for c in cols if "tilbudsavis" in c), None)
-        page_col = next((c for c in cols if "side" in c), None)
-
-        if not price_col or not (product_col or desc_col):
+    # Primær parser: læs hver HTML-tabelrække direkte.
+    for tr in soup.find_all("tr"):
+        cells = [re.sub(r"\s+", " ", c.get_text(" ", strip=True)).strip() for c in tr.find_all(["th", "td"])]
+        if not cells:
             continue
 
-        for _, row in table.iterrows():
-            product = str(row.get(product_col, "")) if product_col else ""
-            desc = str(row.get(desc_col, "")) if desc_col else ""
-            combined = f"{product} {desc}".strip()
-            pr = money(row.get(price_col, ""))
+        # Overskriftsrækker.
+        low_cells = [c.lower() for c in cells]
+        if any("produkter" in c for c in low_cells) and any("pris" in c for c in low_cells):
+            continue
 
-            if not combined or pr is None:
-                continue
+        # En rigtig produktrække skal ende med en kr.-pris.
+        price_idx = None
+        pr = None
+        for i in range(len(cells) - 1, -1, -1):
+            if "kr" in cells[i].lower():
+                candidate = money(cells[i])
+                if candidate is not None:
+                    price_idx = i
+                    pr = candidate
+                    break
 
-            rows.append({
-                "Butik": store,
-                "Vare": product if product and product != "nan" else desc,
-                "Beskrivelse": desc if desc != "nan" else "",
-                "Pris": pr,
-                "Øko": looks_organic(combined),
-                "Avis": str(row.get(flyer_col, "")) if flyer_col else "",
-                "Side": str(row.get(page_col, "")) if page_col else "",
-                "Kilde": url,
-                "Type": "Tilbudsavis",
-            })
+        if price_idx is None or pr is None:
+            continue
+
+        before = cells[:price_idx]
+        if len(before) < 2:
+            continue
+
+        # Rowspan betyder typisk:
+        # 5 felter: avis, side, produkt, beskrivelse, pris
+        # 4 felter: side, produkt, beskrivelse, pris
+        # 3 felter: produkt, beskrivelse, pris
+        product = ""
+        desc = ""
+
+        if len(before) >= 4:
+            possible_flyer = before[-4]
+            possible_page = before[-3]
+            product = before[-2]
+            desc = before[-1]
+
+            # Hvis -3 ikke ligner en side, er der sandsynligvis kun 3 logiske felter
+            # plus noget ekstra markup. Brug derfor de sidste to som produkt/beskrivelse.
+            if re.fullmatch(r"\d{1,3}", possible_page):
+                current_page = possible_page
+                if possible_flyer:
+                    current_flyer = possible_flyer
+            else:
+                product = before[-2]
+                desc = before[-1]
+
+        elif len(before) == 3:
+            first, product, desc = before
+            if re.fullmatch(r"\d{1,3}", first):
+                current_page = first
+            elif re.search(r"\d{1,2}[./-]\d{1,2}", first):
+                current_flyer = first
+
+        else:  # len == 2
+            product, desc = before[-2], before[-1]
+
+        product = "" if product.lower() == "nan" else product.strip()
+        desc = "" if desc.lower() == "nan" else desc.strip()
+        combined = f"{product} {desc}".strip()
+
+        if not combined:
+            continue
+
+        key = (normalize(product), normalize(desc), round(float(pr), 2), current_page)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        rows.append({
+            "Butik": store,
+            "Vare": product or desc,
+            "Beskrivelse": desc,
+            "Pris": float(pr),
+            "Øko": looks_organic(combined),
+            "Avis": current_flyer,
+            "Side": current_page,
+            "Kilde": url,
+            "Type": "Tilbudsavis · struktureret",
+        })
+
+    # Fallback: pandas kan stadig fange en tabel, hvis HTML-strukturen ændrer sig.
+    if not rows:
+        try:
+            tables = pd.read_html(io.StringIO(r.text))
+            for table in tables:
+                cols = [str(c).strip().lower() for c in table.columns]
+                table.columns = cols
+                product_col = next((c for c in cols if "produkt" in c), None)
+                desc_col = next((c for c in cols if "beskrivelse" in c), None)
+                price_col = next((c for c in cols if "pris" in c), None)
+                flyer_col = next((c for c in cols if "tilbudsavis" in c), None)
+                page_col = next((c for c in cols if "side" in c), None)
+
+                if not price_col or not (product_col or desc_col):
+                    continue
+
+                for _, row in table.iterrows():
+                    product = str(row.get(product_col, "")) if product_col else ""
+                    desc = str(row.get(desc_col, "")) if desc_col else ""
+                    product = "" if product == "nan" else product
+                    desc = "" if desc == "nan" else desc
+                    combined = f"{product} {desc}".strip()
+                    pr = money(row.get(price_col, ""))
+
+                    if not combined or pr is None:
+                        continue
+
+                    rows.append({
+                        "Butik": store,
+                        "Vare": product or desc,
+                        "Beskrivelse": desc,
+                        "Pris": float(pr),
+                        "Øko": looks_organic(combined),
+                        "Avis": str(row.get(flyer_col, "")) if flyer_col else "",
+                        "Side": str(row.get(page_col, "")) if page_col else "",
+                        "Kilde": url,
+                        "Type": "Tilbudsavis · struktureret",
+                    })
+        except Exception:
+            pass
 
     if not rows:
         return pd.DataFrame()
 
+    df = pd.DataFrame(rows)
     return (
-        pd.DataFrame(rows)
-        .drop_duplicates(subset=["Butik", "Vare", "Pris", "Avis"])
+        df.drop_duplicates(subset=["Butik", "Vare", "Beskrivelse", "Pris", "Side"])
         .reset_index(drop=True)
     )
 
@@ -1130,30 +1230,12 @@ def fetch_all(include_nemlig=True):
     for store, url in FLYER_SOURCES.items():
         try:
             df = scrape_flyer_table(store, url)
-
-            # Pilot: Netto får en ekstra dyb OCR-scanning af selve avis-siderne,
-            # fordi oversigtstabellen kun indeholder en lille del af varerne.
-            if store == "Netto" and ocr_key():
-                try:
-                    deep = scrape_flyer_pages_ocr(store, url, max_pages=40, pipeline_version=APP_VERSION)
-                    if not deep.empty:
-                        # Behold ALLE OCR-fund til Aviser-fanen.
-                        # Usikre fund filtreres først fra, når Prisrobotten matcher.
-                        df = pd.concat([df, deep], ignore_index=True)
-                        df = df.drop_duplicates(
-                            subset=["Butik", "Vare", "Pris", "Side"],
-                            keep="first",
-                        ).reset_index(drop=True)
-                    status.append((store, len(df), "Tilbudsavis + dyb OCR"))
-                except Exception:
-                    status.append((store, len(df), "Tilbudsavis · OCR kunne ikke supplere"))
-            else:
-                status.append((store, len(df), "Tilbudsavis"))
-
+            organic_count = int(df["Øko"].sum()) if (not df.empty and "Øko" in df.columns) else 0
+            status.append((store, len(df), f"Struktureret avisdata · {organic_count} øko"))
             if not df.empty:
                 frames.append(df)
         except Exception:
-            status.append((store, 0, "Kunne ikke læse avis"))
+            status.append((store, 0, "Kunne ikke læse struktureret avisdata"))
 
     try:
         d365 = scrape_365_flyer()
@@ -1573,11 +1655,6 @@ def current_vs_history(current_row, hist):
 
 def wishlist_match(data, items, organic_only=True, include_nemlig=True):
     base = data.copy()
-
-    # Aviser må gerne vise tvivlsomme OCR-fund, men de må ikke styre Prisrobotten.
-    if not base.empty and "Sikkerhed" in base.columns:
-        ocr_mask = base.get("Type", pd.Series(index=base.index, dtype=str)).fillna("").astype(str).str.contains("OCR", case=False, na=False)
-        base = base[(~ocr_mask) | base["Sikkerhed"].fillna("").eq("Høj")].copy()
 
     if not include_nemlig and not base.empty and "Butik" in base.columns:
         base = base[
@@ -2437,7 +2514,7 @@ with tabs[1]:
 
 with tabs[2]:
     st.subheader("Ugens tilbudsaviser")
-    st.caption("Netto læses nu i to lag: produktlisten + en grundig OCR-scanning af selve avis-siderne. Første opdatering kan derfor tage lidt længere tid.")
+    st.caption("Aviserne læses nu fra den strukturerede produktliste. OCR er sat på pause, fordi den gav for mange falske varer.")
     if st.button("Opdater aviser"):
         with st.spinner("Læser aviser… Netto-scanningen kan tage et par minutter første gang."):
             data, status = fetch_all(include_nemlig=True)
@@ -2466,14 +2543,9 @@ with tabs[2]:
             shown["_Vare_sort"] = shown["Vare_vis"].fillna("").map(danish_sort_key)
             shown = shown.sort_values(["_Butik_sort", "_Vare_sort", "Pris"], kind="stable")
 
-            if "Sikkerhed" not in shown.columns:
-                shown["Sikkerhed"] = ""
-            trusted = shown[~shown["Sikkerhed"].isin(["Mellem", "Lav"])].copy()
-            possible = shown[shown["Sikkerhed"].isin(["Mellem", "Lav"])].copy()
+            st.caption(f"{len(shown)} fundne tilbud · parser v{APP_VERSION}")
 
-            st.caption(f"{len(trusted)} sikre tilbud · {len(possible)} mulige OCR-fund · parser v{APP_VERSION}")
-
-            for _, row in trusted.iterrows():
+            for _, row in shown.iterrows():
                 store = str(row.get("Butik") or "")
                 product = str(row.get("Vare_vis") or row.get("Vare") or "").strip()
                 try:
@@ -2489,18 +2561,6 @@ with tabs[2]:
                 if meta:
                     st.caption(meta)
                 st.divider()
-
-            if not possible.empty:
-                with st.expander(f"🟡 Mulige OCR-fund ({len(possible)})"):
-                    st.caption("Disse er for usikre til at påvirke Prisrobotten.")
-                    for _, row in possible.iterrows():
-                        product = str(row.get("Vare_vis") or row.get("Vare") or "").strip()
-                        store = str(row.get("Butik") or "")
-                        try:
-                            price_txt = f"{float(row.get('Pris')):.2f} kr.".replace(".00", "")
-                        except Exception:
-                            price_txt = "Pris ukendt"
-                        st.write(f"**{product}** · {store} · {price_txt} · {row.get('Sikkerhed', '')}")
 
             with st.expander("🔎 Se tekniske avisdetaljer"):
                 columns = ["Butik", "Vare_vis", "Pris", "Avis", "Side", "Type", "Kilde"]
@@ -2681,7 +2741,10 @@ with tabs[5]:
                             st.caption(f"↳ {raw}")
 
                         st.markdown("#### ✏️ Ret kategorien")
-                        rename_key = "rename_" + re.sub(r"[^a-z0-9]+", "_", normalize(family))
+                        family_norm = normalize(family)
+                        family_slug = re.sub(r"[^a-z0-9]+", "_", family_norm).strip("_") or "vare"
+                        family_hash = hashlib.sha1(family_norm.encode("utf-8")).hexdigest()[:10]
+                        rename_key = f"rename_{family_slug}_{family_hash}"
                         new_name = st.text_input(
                             "Nyt kategorinavn",
                             value=str(family).capitalize(),
