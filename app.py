@@ -18,8 +18,8 @@ try:
 except Exception:
     create_client = None
 
-APP_VERSION = "2.4.1"
-APP_VERSION_TEXT = "Tilbudsugen · pakningsstørrelse + enhedspris"
+APP_VERSION = "2.4.2"
+APP_VERSION_TEXT = "Tilbudsugen · korrekt mængde, enhedspris og rangering"
 
 st.set_page_config(page_title="Øko-robot", page_icon="🥬", layout="centered")
 st.title("🥬 Øko-robot")
@@ -1414,7 +1414,13 @@ def search_tilbudsugen(query, max_pages=3, max_results=80):
                 continue
 
             valid = next((x for x in lines if re.fullmatch(r"\d{2}\.\d{2}\s*-\s*\d{2}\.\d{2}", x)), "")
-            qty = next((x for x in lines if " af " in x.lower() and re.search(r"\b(stk|kg|g|ltr|l|ml|cl)\b", x.lower())), "")
+            qty = next((
+                x for x in lines
+                if re.search(
+                    r"\b\d+(?:[.,]\d+)?\s*(?:bk\.|pk\.|ps\.|bdt\.|stk\.)?\s*(?:af\s*)?\d+(?:[.,]\d+)?\s*(?:stk|kg|g|ltr|liter|l|ml|cl)\b",
+                    x.lower()
+                )
+            ), "")
 
             price = None
             for line in lines:
@@ -1436,6 +1442,22 @@ def search_tilbudsugen(query, max_pages=3, max_results=80):
                 if uv is not None:
                     unit_value, unit_name, unit_text = uv, un, line
                     break
+
+            # Tilbudsugen viser normalt både mængde og enhedspris. Hvis HTML-kortet
+            # kun gav os den ene, udleder vi den anden sikkert ud fra prisforholdet.
+            if not qty and unit_value is not None and unit_name in ("stk", "kg", "l") and unit_value > 0:
+                inferred_amount = float(price) / float(unit_value)
+                if unit_name == "stk" and abs(inferred_amount - round(inferred_amount)) < 0.08:
+                    qty = f"{int(round(inferred_amount))} stk."
+                elif unit_name in ("kg", "l"):
+                    qty = f"{inferred_amount:.2f} {unit_name}"
+
+            if unit_value is None and qty:
+                _qt, _amount, _base = quantity_info(qty)
+                if _amount and _base in ("stk", "kg", "l"):
+                    unit_value = round(float(price) / float(_amount), 2)
+                    unit_name = _base
+                    unit_text = f"{unit_value:.2f} kr/{unit_name}"
 
             card_text = " ".join(lines)
             member_hint = any(t in card_text.lower() for t in (
@@ -1837,7 +1859,10 @@ def candidate_unit_info(row):
         price = float(row.get("Pris"))
     except Exception:
         return None, None
-    return unit_price(price, f"{row.get('Vare', '')} {row.get('Beskrivelse', '')}")
+    return unit_price(
+        price,
+        f"{row.get('Vare', '')} {row.get('Beskrivelse', '')} {row.get('Mængde', '')}"
+    )
 
 
 def rank_current_candidates(candidates):
@@ -1999,7 +2024,14 @@ def wishlist_match(data, items, organic_only=True, include_nemlig=True, include_
                     "Butik": alt_store,
                     "Vare": alt_name,
                     "Pris": alt_price,
-                    "Mængde": str(alt.get("Mængde") or alt.get("Beskrivelse") or ""),
+                    "Mængde": (
+                        str(alt.get("Mængde") or alt.get("Beskrivelse") or "")
+                        or (
+                            f"{int(round(float(alt.get('Pris')) / float(alt_upr)))} stk."
+                            if alt_upr is not None and alt_uunit == "stk"
+                            else ""
+                        )
+                    ),
                     "Enhedspris": (
                         f"{alt_upr:.2f} kr/{alt_uunit}"
                         if alt_upr is not None and alt_uunit else ""
@@ -2027,7 +2059,14 @@ def wishlist_match(data, items, organic_only=True, include_nemlig=True, include_
                     "Vare": r["Vare"],
                     "Pris": r["Pris"],
                     "Vurdering": verdict,
-                    "Mængde": str(r.get("Mængde") or r.get("Beskrivelse") or ""),
+                    "Mængde": (
+                        str(r.get("Mængde") or r.get("Beskrivelse") or "")
+                        or (
+                            f"{int(round(float(r.get('Pris')) / float(upr)))} stk."
+                            if upr is not None and uunit == "stk"
+                            else ""
+                        )
+                    ),
                     "Enhedspris": enhed,
                     "Prisgrundlag": r["Type"],
                     "Alternativer": alternative_offers,
@@ -2831,7 +2870,14 @@ with tabs[1]:
                 key=lambda col: col.map(danish_sort_key),
                 kind="stable",
             ).reset_index(drop=True)
-        st.dataframe(result, hide_index=True, use_container_width=True)
+        # Den kompakte tabel viser kun læsbare felter. Alternativer er en intern
+        # liste af dictionaries og vises pænt i kortet nedenunder i stedet.
+        preferred_cols = [
+            "Du mangler", "Butik", "Vare", "Pris", "Vurdering",
+            "Mængde", "Enhedspris", "Prisgrundlag", "Senest set"
+        ]
+        table_cols = [c for c in preferred_cols if c in result.columns]
+        st.dataframe(result[table_cols], hide_index=True, use_container_width=True)
         st.markdown("### Prisrobotten siger")
         for _, rr in result.iterrows():
             vare = str(rr.get("Du mangler", ""))
