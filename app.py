@@ -18,8 +18,8 @@ try:
 except Exception:
     create_client = None
 
-APP_VERSION = "2.3.4"
-APP_VERSION_TEXT = "Tilbudsugen · tydelig historik + skjulte medlemstilbud"
+APP_VERSION = "2.4.0"
+APP_VERSION_TEXT = "Tilbudsugen · bedste tilbud + alternativer"
 
 st.set_page_config(page_title="Øko-robot", page_icon="🥬", layout="centered")
 st.title("🥬 Øko-robot")
@@ -1981,6 +1981,33 @@ def wishlist_match(data, items, organic_only=True, include_nemlig=True, include_
             ranked_now = rank_current_candidates(pool)
             _, r, upr, uunit = ranked_now[0]
 
+            # Gem op til fem andre aktuelle tilbud, rangeret på samme måde som vinderen.
+            alternative_offers = []
+            seen_alt = set()
+            for _alt_score, alt, alt_upr, alt_uunit in ranked_now[1:]:
+                try:
+                    alt_price = float(alt.get("Pris"))
+                except Exception:
+                    continue
+                alt_store = str(alt.get("Butik") or "")
+                alt_name = str(alt.get("Vare") or "")
+                alt_key = (alt_store.casefold(), alt_name.casefold(), round(alt_price, 2))
+                if alt_key in seen_alt:
+                    continue
+                seen_alt.add(alt_key)
+                alternative_offers.append({
+                    "Butik": alt_store,
+                    "Vare": alt_name,
+                    "Pris": alt_price,
+                    "Enhedspris": (
+                        f"{alt_upr:.2f} kr/{alt_uunit}"
+                        if alt_upr is not None and alt_uunit else ""
+                    ),
+                    "Medlem": bool(alt.get("Medlemspris", False)),
+                })
+                if len(alternative_offers) >= 5:
+                    break
+
             # En almindelig Nemlig-onlinepris må ikke overtage en billigere,
             # frisk bonpris fra fx Netto alene fordi Nemlig-pakken er mindre.
             if not offer_candidates and str(r.get("Type", "")).strip().lower() == "online pris":
@@ -2001,6 +2028,7 @@ def wishlist_match(data, items, organic_only=True, include_nemlig=True, include_
                     "Vurdering": verdict,
                     "Enhedspris": enhed,
                     "Prisgrundlag": r["Type"],
+                    "Alternativer": alternative_offers,
                     "Senest set": "Denne uge",
                     "Svar": (
                         (
@@ -2066,6 +2094,7 @@ def wishlist_match(data, items, organic_only=True, include_nemlig=True, include_
                 "Vurdering": hist_verdict,
                 "Enhedspris": hist_unit,
                 "Prisgrundlag": "Historik · ikke aktuelt tilbud",
+                "Alternativer": [],
                 "Senest set": hist["date"],
                 "Svar": answer + (f" Enhedspris: {hist_unit}." if hist_unit else ""),
             })
@@ -2091,6 +2120,7 @@ def wishlist_match(data, items, organic_only=True, include_nemlig=True, include_
                 "Vurdering": "",
                 "Enhedspris": "",
                 "Prisgrundlag": "Ingen sikker pris endnu",
+                "Alternativer": [],
                 "Senest set": "",
                 "Svar": "Desværre ingen almindelige tilbud lige nu, og jeg har endnu ikke nok bonhistorik til at pege på den billigste butik." + hidden_note,
             })
@@ -2813,6 +2843,20 @@ with tabs[1]:
             if rr.get("Enhedspris"):
                 st.caption(str(rr.get("Enhedspris")))
             st.caption(str(rr.get("Svar", "")))
+
+            alternatives = rr.get("Alternativer", [])
+            if isinstance(alternatives, list) and alternatives:
+                with st.expander(f"Se {len(alternatives)} andre aktuelle tilbud"):
+                    for alt in alternatives:
+                        try:
+                            alt_price_txt = f"{float(alt.get('Pris')):.2f} kr."
+                        except Exception:
+                            alt_price_txt = str(alt.get("Pris", ""))
+                        member_txt = " · medlems/app-pris" if alt.get("Medlem") else ""
+                        st.markdown(f"**{alt.get('Butik', '')} · {alt_price_txt}**{member_txt}")
+                        st.write(str(alt.get("Vare", "")))
+                        if alt.get("Enhedspris"):
+                            st.caption(str(alt.get("Enhedspris")))
             st.divider()
         st.caption("Hvis der ikke er et aktuelt tilbud, bruger robotten dine gemte bonpriser og andre priser, den faktisk har observeret – aldrig en gættet normalpris.")
         found = result["Pris"].dropna()
