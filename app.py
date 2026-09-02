@@ -18,8 +18,8 @@ try:
 except Exception:
     create_client = None
 
-APP_VERSION = "2.3.3"
-APP_VERSION_TEXT = "Tilbudsugen · korrekt pris/dato + stramt øko-filter"
+APP_VERSION = "2.3.4"
+APP_VERSION_TEXT = "Tilbudsugen · tydelig historik + skjulte medlemstilbud"
 
 st.set_page_config(page_title="Øko-robot", page_icon="🥬", layout="centered")
 st.title("🥬 Øko-robot")
@@ -1910,6 +1910,7 @@ def wishlist_match(data, items, organic_only=True, include_nemlig=True, include_
     rows = []
     for item in items:
         candidates = []
+        excluded_member_candidates = []
         query_family = product_family(item, rules=load_habit_rules())
 
         # Primær aktuelle tilbudskilde: søg varen direkte hos Tilbudsugen.
@@ -1935,6 +1936,7 @@ def wishlist_match(data, items, organic_only=True, include_nemlig=True, include_
                         if not is_member and str(tr.get("Kilde", "")).startswith("http"):
                             is_member = tilbudsugen_detail_is_member(str(tr.get("Kilde")))
                         if is_member:
+                            excluded_member_candidates.append((score, tr))
                             continue
                     candidates.append((score, tr))
         except Exception:
@@ -2031,13 +2033,30 @@ def wishlist_match(data, items, organic_only=True, include_nemlig=True, include_
                     f"Desværre ingen billigere aktuelt tilbud/pris. Ud fra priser set de seneste 60 dage "
                     f"plejer den at være billigst hos {hist['store']} til ca. {hist['price']:.2f} kr.{unit_note} {age_note}"
                 )
-                shown_store = hist["store"]
+                shown_store = "Historik: " + str(hist["store"])
             hist_unit = ""
             if hist.get("unit_price") is not None and hist.get("unit_name"):
                 try:
                     hist_unit = f"{float(hist['unit_price']):.2f} kr/{hist['unit_name']}"
                 except Exception:
                     hist_unit = ""
+            if excluded_member_candidates and not include_member_deals:
+                try:
+                    _, member_row = sorted(
+                        excluded_member_candidates,
+                        key=lambda x: float(x[1].get("Pris", 999999))
+                    )[0]
+                    answer = (
+                        f"Der findes et aktuelt øko-tilbud hos {member_row['Butik']} til "
+                        f"{float(member_row['Pris']):.2f} kr., men det er medlems-/app-pris og er derfor skjult. "
+                        + answer
+                    )
+                except Exception:
+                    answer = (
+                        "Der findes aktuelle medlems-/app-tilbud, men de er skjult med din nuværende indstilling. "
+                        + answer
+                    )
+
             hist_verdict, hist_verdict_note = price_verdict(item, hist["price"])
             rows.append({
                 "Du mangler": item,
@@ -2046,11 +2065,24 @@ def wishlist_match(data, items, organic_only=True, include_nemlig=True, include_
                 "Pris": hist["price"],
                 "Vurdering": hist_verdict,
                 "Enhedspris": hist_unit,
-                "Prisgrundlag": hist["label"],
+                "Prisgrundlag": "Historik · ikke aktuelt tilbud",
                 "Senest set": hist["date"],
                 "Svar": answer + (f" Enhedspris: {hist_unit}." if hist_unit else ""),
             })
         else:
+            hidden_note = ""
+            if excluded_member_candidates and not include_member_deals:
+                try:
+                    _, member_row = sorted(
+                        excluded_member_candidates,
+                        key=lambda x: float(x[1].get("Pris", 999999))
+                    )[0]
+                    hidden_note = (
+                        f" Der findes dog et aktuelt medlems-/app-tilbud hos {member_row['Butik']} "
+                        f"til {float(member_row['Pris']):.2f} kr., som er skjult."
+                    )
+                except Exception:
+                    hidden_note = " Der findes dog aktuelle medlems-/app-tilbud, som er skjult."
             rows.append({
                 "Du mangler": item,
                 "Butik": "Ikke fundet",
@@ -2060,7 +2092,7 @@ def wishlist_match(data, items, organic_only=True, include_nemlig=True, include_
                 "Enhedspris": "",
                 "Prisgrundlag": "Ingen sikker pris endnu",
                 "Senest set": "",
-                "Svar": "Desværre ingen tilbud lige nu, og jeg har endnu ikke nok bonhistorik til at pege på den billigste butik.",
+                "Svar": "Desværre ingen almindelige tilbud lige nu, og jeg har endnu ikke nok bonhistorik til at pege på den billigste butik." + hidden_note,
             })
 
     return pd.DataFrame(rows)
