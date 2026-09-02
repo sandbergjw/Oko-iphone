@@ -18,8 +18,8 @@ try:
 except Exception:
     create_client = None
 
-APP_VERSION = "2.4.3"
-APP_VERSION_TEXT = "Tilbudsugen · korrekt stk.-pris og mængde fra detaljeside"
+APP_VERSION = "2.4.4"
+APP_VERSION_TEXT = "Tilbudsugen · pakkepris må ikke forveksles med enhedspris"
 
 st.set_page_config(page_title="Øko-robot", page_icon="🥬", layout="centered")
 st.title("🥬 Øko-robot")
@@ -1466,7 +1466,12 @@ def search_tilbudsugen(query, max_pages=3, max_results=80):
             for line in lines:
                 if re.fullmatch(r"\d{2}\.\d{2}\s*-\s*\d{2}\.\d{2}", line):
                     continue
-                if "/" in line and re.search(r"\b(kg|ltr|l|stk)\b", line.lower()):
+                # Enhedspriser som "15,38 kr/kg", "2,17 kr/stk" og
+                # "1,30,- / stk." er metadata – aldrig varens salgspris.
+                if re.search(
+                    r"(?:kr\.?\s*/|,-?\s*/|/\s*)(?:kg|g|ltr|liter|l|ml|cl|stk)\b",
+                    line.lower()
+                ):
                     continue
                 p = parse_offer_money(line)
                 if p is not None:
@@ -1497,9 +1502,14 @@ def search_tilbudsugen(query, max_pages=3, max_results=80):
             # Fx 22 / 2,75 = 8 stk. og 30 / 3,00 = 10 stk.
             if not qty and unit_value is not None and unit_name in ("stk", "kg", "l") and unit_value > 0:
                 inferred_amount = float(price) / float(unit_value)
-                if unit_name == "stk" and abs(inferred_amount - round(inferred_amount)) < 0.08:
+                if (
+                    unit_name == "stk"
+                    and inferred_amount >= 1
+                    and inferred_amount <= 100
+                    and abs(inferred_amount - round(inferred_amount)) < 0.08
+                ):
                     qty = f"{int(round(inferred_amount))} stk."
-                elif unit_name in ("kg", "l"):
+                elif unit_name in ("kg", "l") and 0.10 <= inferred_amount <= 25:
                     qty = f"{inferred_amount:.2f} {unit_name}"
 
             if unit_value is None and qty:
