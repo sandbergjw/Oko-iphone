@@ -18,8 +18,8 @@ try:
 except Exception:
     create_client = None
 
-APP_VERSION = "2.4.0"
-APP_VERSION_TEXT = "Tilbudsugen · bedste tilbud + alternativer"
+APP_VERSION = "2.4.1"
+APP_VERSION_TEXT = "Tilbudsugen · pakningsstørrelse + enhedspris"
 
 st.set_page_config(page_title="Øko-robot", page_icon="🥬", layout="centered")
 st.title("🥬 Øko-robot")
@@ -1999,6 +1999,7 @@ def wishlist_match(data, items, organic_only=True, include_nemlig=True, include_
                     "Butik": alt_store,
                     "Vare": alt_name,
                     "Pris": alt_price,
+                    "Mængde": str(alt.get("Mængde") or alt.get("Beskrivelse") or ""),
                     "Enhedspris": (
                         f"{alt_upr:.2f} kr/{alt_uunit}"
                         if alt_upr is not None and alt_uunit else ""
@@ -2026,6 +2027,7 @@ def wishlist_match(data, items, organic_only=True, include_nemlig=True, include_
                     "Vare": r["Vare"],
                     "Pris": r["Pris"],
                     "Vurdering": verdict,
+                    "Mængde": str(r.get("Mængde") or r.get("Beskrivelse") or ""),
                     "Enhedspris": enhed,
                     "Prisgrundlag": r["Type"],
                     "Alternativer": alternative_offers,
@@ -2092,6 +2094,7 @@ def wishlist_match(data, items, organic_only=True, include_nemlig=True, include_
                 "Vare": hist["item"],
                 "Pris": hist["price"],
                 "Vurdering": hist_verdict,
+                "Mængde": "",
                 "Enhedspris": hist_unit,
                 "Prisgrundlag": "Historik · ikke aktuelt tilbud",
                 "Alternativer": [],
@@ -2118,6 +2121,7 @@ def wishlist_match(data, items, organic_only=True, include_nemlig=True, include_
                 "Vare": "",
                 "Pris": None,
                 "Vurdering": "",
+                "Mængde": "",
                 "Enhedspris": "",
                 "Prisgrundlag": "Ingen sikker pris endnu",
                 "Alternativer": [],
@@ -2840,8 +2844,13 @@ with tabs[1]:
                 pris_txt = "Ingen sikker pris"
             st.markdown(f"**{vare}** · {vurdering}")
             st.write(f"{butik} · {pris_txt}")
+            package_bits = []
+            if rr.get("Mængde"):
+                package_bits.append(str(rr.get("Mængde")))
             if rr.get("Enhedspris"):
-                st.caption(str(rr.get("Enhedspris")))
+                package_bits.append(str(rr.get("Enhedspris")))
+            if package_bits:
+                st.caption(" · ".join(package_bits))
             st.caption(str(rr.get("Svar", "")))
 
             alternatives = rr.get("Alternativer", [])
@@ -2855,8 +2864,13 @@ with tabs[1]:
                         member_txt = " · medlems/app-pris" if alt.get("Medlem") else ""
                         st.markdown(f"**{alt.get('Butik', '')} · {alt_price_txt}**{member_txt}")
                         st.write(str(alt.get("Vare", "")))
+                        alt_bits = []
+                        if alt.get("Mængde"):
+                            alt_bits.append(str(alt.get("Mængde")))
                         if alt.get("Enhedspris"):
-                            st.caption(str(alt.get("Enhedspris")))
+                            alt_bits.append(str(alt.get("Enhedspris")))
+                        if alt_bits:
+                            st.caption(" · ".join(alt_bits))
             st.divider()
         st.caption("Hvis der ikke er et aktuelt tilbud, bruger robotten dine gemte bonpriser og andre priser, den faktisk har observeret – aldrig en gættet normalpris.")
         found = result["Pris"].dropna()
