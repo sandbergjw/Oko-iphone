@@ -18,8 +18,8 @@ try:
 except Exception:
     create_client = None
 
-APP_VERSION = "2.4.4"
-APP_VERSION_TEXT = "Tilbudsugen · pakkepris må ikke forveksles med enhedspris"
+APP_VERSION = "2.4.5"
+APP_VERSION_TEXT = "Tilbudsugen · falske dubletter væk + korrekt enhedsvurdering"
 
 st.set_page_config(page_title="Øko-robot", page_icon="🥬", layout="centered")
 st.title("🥬 Øko-robot")
@@ -1529,6 +1529,16 @@ def search_tilbudsugen(query, max_pages=3, max_results=80):
             # ellers indeholde tekst fra nabotilbud og fejlagtigt gøre fx skrabeæg økologiske.
             organic = looks_organic(product)
             seen.add(single_url)
+            # Hvis pris/enhedspris uden fundet mængde svarer til en absurd lille
+            # pakke, er prisfeltet næsten sikkert læst forkert fra kortet.
+            if (
+                not qty and unit_value is not None and unit_name in ("kg", "l")
+                and unit_value > 0
+            ):
+                inferred_amount_check = float(price) / float(unit_value)
+                if inferred_amount_check < 0.10:
+                    continue
+
             rows.append({
                 "Butik": store,
                 "Vare": product,
@@ -1557,7 +1567,19 @@ def search_tilbudsugen(query, max_pages=3, max_results=80):
             "Butik", "Vare", "Beskrivelse", "Pris", "Øko", "Avis", "Side", "Kilde", "Type",
             "Mængde", "Gyldig", "UnitPrice", "UnitName", "Enhedspris_kilde", "Medlemspris",
         ])
-    return pd.DataFrame(rows).drop_duplicates(subset=["Butik", "Vare", "Pris", "Gyldig"]).reset_index(drop=True)
+
+    best_rows = {}
+    for row in rows:
+        key = (normalize(row.get("Butik", "")), normalize(row.get("Vare", "")))
+        quality = (
+            1 if str(row.get("Mængde") or "").strip() else 0,
+            1 if row.get("UnitPrice") not in (None, "") else 0,
+        )
+        prev = best_rows.get(key)
+        if prev is None or quality > prev[0]:
+            best_rows[key] = (quality, row)
+
+    return pd.DataFrame([x[1] for x in best_rows.values()]).reset_index(drop=True)
 
 def fetch_all(include_nemlig=True):
     """v2.3: Hele aviser crawles ikke længere. Tilbudsugen søges direkte pr. vare."""
@@ -2114,7 +2136,12 @@ def wishlist_match(data, items, organic_only=True, include_nemlig=True, include_
 
             if candidates:
                 enhed = f"{upr:.2f} kr/{uunit}" if upr is not None and uunit else ""
-                verdict, verdict_note = price_verdict(item, float(r["Pris"]))
+                verdict, verdict_note = price_verdict(
+                    item,
+                    float(r["Pris"]),
+                    current_unit_price=upr,
+                    current_unit_name=uunit,
+                )
                 rows.append({
                     "Du mangler": item,
                     "Butik": r["Butik"],
@@ -2793,22 +2820,56 @@ def price_stats(query):
     }
 
 
-def price_verdict(query, price):
-    """Forsigtig vurdering: bruger medianen af faktiske tidligere køb."""
-    stats = price_stats(query)
-    if not stats:
-        return "🆕 Ny pris", "Ikke nok prishistorik endnu"
-    normal = stats["median"]
+def unit_price_stats(query, unit_name):
+    history = load_purchase_history()
+    values = []
+    for row in history:
+        item_name = row.get("item", "")
+        if not same_product_family(query, item_name) and match_score(query, item_name) < 0.55:
+            continue
+        try:
+            paid = float(row.get("paid_price"))
+        except Exception:
+            continue
+        upr, un = unit_price(paid, item_name)
+        if upr is not None and un == unit_name:
+            values.append(float(upr))
+    if not values:
+        return None
+    return {
+        "n": len(values),
+        "median": float(pd.Series(values).median()),
+    }
+
+
+def price_verdict(query, price, current_unit_price=None, current_unit_name=None):
+    """Forsigtig vurdering: sammenligner helst samme enhed, ellers pakkepris."""
+    normal = None
+    compare_price = float(price)
+
+    if current_unit_price is not None and current_unit_name:
+        ustats = unit_price_stats(query, current_unit_name)
+        if ustats:
+            normal = ustats["median"]
+            compare_price = float(current_unit_price)
+
+    if normal is None:
+        stats = price_stats(query)
+        if not stats:
+            return "🆕 Ny pris", "Ikke nok prishistorik endnu"
+        normal = stats["median"]
+
     if normal <= 0:
         return "🆕 Ny pris", "Ikke nok prishistorik endnu"
-    pct = (normal - float(price)) / normal * 100
+
+    pct = (normal - compare_price) / normal * 100
 
     if pct >= 15:
         return "🔥 Superpris", f"{pct:.0f}% under din typiske pris"
     if pct >= 5:
         return "👍 God pris", f"{pct:.0f}% under din typiske pris"
     if pct > -5:
-        return "😐 Normal pris", f"omkring din typiske pris på {normal:.2f} kr."
+        return "😐 Normal pris", f"omkring dit typiske prisniveau"
     return "⚠️ Dyrt", f"{abs(pct):.0f}% over din typiske pris"
 
 
