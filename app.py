@@ -18,8 +18,8 @@ try:
 except Exception:
     create_client = None
 
-APP_VERSION = "2.4.7"
-APP_VERSION_TEXT = "Aviser · ingen gamle søgeresultater + stram relevans"
+APP_VERSION = "2.4.8"
+APP_VERSION_TEXT = "Aviser · hent alle økologiske tilbud"
 
 st.set_page_config(page_title="Øko-robot", page_icon="🥬", layout="centered")
 st.title("🥬 Øko-robot")
@@ -3082,10 +3082,28 @@ with tabs[2]:
     # Et gammelt søgeresultat må aldrig blive stående under en ny søgetekst.
     last_offer_query = str(st.session_state.get("offer_search_query", "") or "").strip()
     current_offer_query = str(offer_query or "").strip()
-    if current_offer_query and normalize(current_offer_query) != normalize(last_offer_query):
+    if (
+        current_offer_query
+        and st.session_state.get("offer_search_mode") != "organic"
+        and normalize(current_offer_query) != normalize(last_offer_query)
+    ):
         st.session_state["offer_search_data"] = pd.DataFrame()
 
-    if st.button("🔎 Søg aktuelle tilbud", type="primary", disabled=not current_offer_query):
+    c_search, c_organic = st.columns(2)
+    with c_search:
+        search_clicked = st.button(
+            "🔎 Søg aktuelle tilbud",
+            type="primary",
+            disabled=not current_offer_query,
+            use_container_width=True,
+        )
+    with c_organic:
+        organic_clicked = st.button(
+            "🌱 Hent alle øko-tilbud",
+            use_container_width=True,
+        )
+
+    if search_clicked:
         with st.spinner("Søger Tilbudsugen…"):
             raw_offer_data = search_tilbudsugen(current_offer_query, max_pages=3, max_results=100)
 
@@ -3109,6 +3127,29 @@ with tabs[2]:
 
             st.session_state["offer_search_data"] = raw_offer_data
             st.session_state["offer_search_query"] = current_offer_query
+            st.session_state["offer_search_mode"] = "vare"
+
+    if organic_clicked:
+        with st.spinner("Henter økologiske tilbud fra Tilbudsugen…"):
+            organic_frames = []
+            for organic_query in ("øko", "økologisk"):
+                part = search_tilbudsugen(organic_query, max_pages=8, max_results=300)
+                if part is not None and not part.empty:
+                    organic_frames.append(part)
+
+            if organic_frames:
+                raw_offer_data = pd.concat(organic_frames, ignore_index=True)
+                if "Øko" in raw_offer_data.columns:
+                    raw_offer_data = raw_offer_data[raw_offer_data["Øko"] == True].copy()
+                dedupe_cols = [c for c in ["Butik", "Vare", "Pris", "Gyldig"] if c in raw_offer_data.columns]
+                if dedupe_cols:
+                    raw_offer_data = raw_offer_data.drop_duplicates(subset=dedupe_cols).reset_index(drop=True)
+            else:
+                raw_offer_data = pd.DataFrame()
+
+            st.session_state["offer_search_data"] = raw_offer_data
+            st.session_state["offer_search_query"] = "__ALL_ORGANIC__"
+            st.session_state["offer_search_mode"] = "organic"
 
     shown = st.session_state.get("offer_search_data", pd.DataFrame())
     if shown is None or shown.empty:
@@ -3118,7 +3159,10 @@ with tabs[2]:
             st.info("Ingen aktuelle tilbud fundet med denne søgning og de valgte filtre.")
     else:
         stores = st.multiselect("Butikker", OFFER_STORES, default=OFFER_STORES, key="tu_stores")
-        only_organic = st.toggle("Vis kun økologisk", value=False, key="only_org_tu")
+        organic_mode = st.session_state.get("offer_search_mode") == "organic"
+        only_organic = st.toggle("Vis kun økologisk", value=organic_mode, key="only_org_tu")
+        if organic_mode:
+            st.caption("🌱 Viser samlet økologiske tilbud fundet på tværs af butikker.")
         hide_member = st.toggle("Skjul medlems-/app-tilbud", value=True, key="hide_member_tu")
         shown = shown[shown["Butik"].isin(stores)].copy()
         if only_organic:
