@@ -18,8 +18,8 @@ try:
 except Exception:
     create_client = None
 
-APP_VERSION = "2.4.5"
-APP_VERSION_TEXT = "Tilbudsugen · falske dubletter væk + korrekt enhedsvurdering"
+APP_VERSION = "2.4.6"
+APP_VERSION_TEXT = "stram produktmatch + skelnen mellem bon og prisobservation"
 
 st.set_page_config(page_title="Øko-robot", page_icon="🥬", layout="centered")
 st.title("🥬 Øko-robot")
@@ -112,6 +112,10 @@ def product_family(text, rules=None):
         if target:
             return target
 
+    # Æg skal være et helt ord. Ellers bliver fx "pålæg" fejlagtigt til "æg".
+    if re.search(r"(?<![a-z0-9æøå])(?:æg|aeg)(?![a-z0-9æøå])", n):
+        return "æg"
+
     families = [
         ("kærnemælk", ("kærnemælk", "kaernemaelk", "kærnem", "kaernem")),
         ("piskefløde", ("piskefløde", "piskeflø", "piskefloede", "piskeflo")),
@@ -131,7 +135,6 @@ def product_family(text, rules=None):
         ("smørbar", ("smørbar", "smørbart", "blandingsprodukt", "smørblanding")),
         ("smør", (" smør ", "smør 200", "smør 250", "smør 500", "butter")),
         ("leverpostej", ("leverpostej", "leverpost")),
-        ("æg", (" æg ", "æg ", " æg", "aeg")),
     ]
     padded = f" {n} "
     for family, variants in families:
@@ -2175,23 +2178,25 @@ def wishlist_match(data, items, organic_only=True, include_nemlig=True, include_
         # Ingen aktuel avispris: brug kun en pris vi faktisk tidligere har observeret.
         hist = historical_best_price(item, organic_only=organic_only, include_nemlig=include_nemlig)
         if hist:
+            hist_source_label = "Bonhistorik" if hist.get("source_kind") == "purchase" else "Prisobservation"
             if hist.get("stale"):
                 answer = (
                     f"Desværre ingen tilbud lige nu. Jeg har tidligere set varen hos {hist['store']} "
                     f"til {hist['price']:.2f} kr., men prisen er over 60 dage gammel, så jeg bruger den ikke "
                     f"til at udpege den billigste butik."
                 )
-                shown_store = "Historik: " + str(hist["store"])
+                shown_store = f"{hist_source_label}: {hist['store']}"
             else:
                 age_note = "Prisen er frisk." if hist.get("age", 999) <= 30 else f"Senest set for {hist.get('age')} dage siden."
                 unit_note = ""
                 if hist.get("unit_price") is not None and hist.get("unit_name"):
                     unit_note = f" ({float(hist['unit_price']):.2f} kr/{hist['unit_name']})"
                 answer = (
-                    f"Desværre ingen billigere aktuelt tilbud/pris. Ud fra priser set de seneste 60 dage "
-                    f"plejer den at være billigst hos {hist['store']} til ca. {hist['price']:.2f} kr.{unit_note} {age_note}"
+                    f"Desværre ingen billigere aktuelt tilbud/pris. Ud fra priser robotten faktisk har set "
+                    f"de seneste 60 dage ligger den laveste sammenlignelige pris hos {hist['store']} omkring "
+                    f"{hist['price']:.2f} kr.{unit_note} {age_note}"
                 )
-                shown_store = "Historik: " + str(hist["store"])
+                shown_store = f"{hist_source_label}: {hist['store']}"
             hist_unit = ""
             if hist.get("unit_price") is not None and hist.get("unit_name"):
                 try:
@@ -2224,7 +2229,7 @@ def wishlist_match(data, items, organic_only=True, include_nemlig=True, include_
                 "Vurdering": hist_verdict,
                 "Mængde": "",
                 "Enhedspris": hist_unit,
-                "Prisgrundlag": "Historik · ikke aktuelt tilbud",
+                "Prisgrundlag": f"{hist_source_label} · ikke aktuelt tilbud",
                 "Alternativer": [],
                 "Senest set": hist["date"],
                 "Svar": answer + (f" Enhedspris: {hist_unit}." if hist_unit else ""),
@@ -2505,7 +2510,13 @@ def historical_best_price(query, organic_only=True, include_nemlig=True):
             and not looks_organic(canonical_item or "")
         ):
             continue
-        if not same_product_family(query, r.get("item", "")) and match_score(query, r.get("item", "")) < 0.55:
+        hist_ok, _ = safe_wishlist_product_match(
+            query,
+            r.get("item", ""),
+            query_family=product_family(query, rules=load_habit_rules()),
+            product_family_name=product_family(r.get("item", ""), rules=load_habit_rules()),
+        )
+        if not hist_ok:
             continue
         try:
             price = float(r.get("price"))
@@ -2524,6 +2535,8 @@ def historical_best_price(query, organic_only=True, include_nemlig=True):
             "unit_name": r.get("unit_name"),
             "date": r.get("observed_date", ""),
             "age": age_days(r.get("observed_date")),
+            "source_kind": "observation",
+            "price_type": r.get("price_type"),
         })
 
     try:
@@ -2535,7 +2548,13 @@ def historical_best_price(query, organic_only=True, include_nemlig=True):
 
     for r in purchases:
         item_name = r.get("item", "")
-        if not same_product_family(query, item_name) and match_score(query, item_name) < 0.55:
+        hist_ok, _ = safe_wishlist_product_match(
+            query,
+            item_name,
+            query_family=product_family(query, rules=load_habit_rules()),
+            product_family_name=product_family(item_name, rules=load_habit_rules()),
+        )
+        if not hist_ok:
             continue
         canonical_item = product_family(item_name, rules=load_habit_rules())
         if organic_only and not (
@@ -2565,6 +2584,8 @@ def historical_best_price(query, organic_only=True, include_nemlig=True):
             "unit_name": uunit,
             "date": r.get("purchased_at", ""),
             "age": age_days(r.get("purchased_at")),
+            "source_kind": "purchase",
+            "price_type": "receipt",
         })
 
     if not candidates:
@@ -2611,7 +2632,10 @@ def historical_best_price(query, organic_only=True, include_nemlig=True):
         if ranked:
             ranked.sort(key=lambda x: (x[0], -x[1]))
             median_basis, observations, latest = ranked[0]
-            freshness = "Frisk bonpris" if latest["age"] <= FRESH_AGE_DAYS else "Ældre bonpris"
+            if latest.get("source_kind") == "purchase":
+                freshness = "Frisk bonpris" if latest["age"] <= FRESH_AGE_DAYS else "Ældre bonpris"
+            else:
+                freshness = "Frisk prisobservation" if latest["age"] <= FRESH_AGE_DAYS else "Ældre prisobservation"
             return {
                 "store": latest["store"],
                 "item": latest["item"],
@@ -2623,6 +2647,8 @@ def historical_best_price(query, organic_only=True, include_nemlig=True):
                 "observations": observations,
                 "stale": False,
                 "age": latest["age"],
+                "source_kind": latest.get("source_kind", "observation"),
+                "price_type": latest.get("price_type"),
             }
 
     # Alt er ældre end 60 dage: vis kun som historisk information,
@@ -2637,6 +2663,8 @@ def historical_best_price(query, organic_only=True, include_nemlig=True):
         "observations": 1,
         "stale": True,
         "age": latest_old["age"],
+        "source_kind": latest_old.get("source_kind", "observation"),
+        "price_type": latest_old.get("price_type"),
     }
 
 
