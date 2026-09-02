@@ -18,8 +18,8 @@ try:
 except Exception:
     create_client = None
 
-APP_VERSION = "2.4.8"
-APP_VERSION_TEXT = "Aviser · hent alle økologiske tilbud"
+APP_VERSION = "2.4.9"
+APP_VERSION_TEXT = "Aviser · scan butikkerne og filtrer alle øko-tilbud"
 
 st.set_page_config(page_title="Øko-robot", page_icon="🥬", layout="centered")
 st.title("🥬 Øko-robot")
@@ -1404,7 +1404,7 @@ def tilbudsugen_search_term(query):
 
 
 @st.cache_data(ttl=1200, show_spinner=False)
-def search_tilbudsugen(query, max_pages=3, max_results=80):
+def search_tilbudsugen(query, max_pages=3, max_results=80, enrich_details=True):
     """Søg aktuelle tilbud på Tilbudsugen og læs deres strukturerede produktkort – ingen OCR."""
     query = tilbudsugen_search_term(query)
     if not query:
@@ -1494,7 +1494,7 @@ def search_tilbudsugen(query, max_pages=3, max_results=80):
             # Nogle Tilbudsugen-kort skjuler mængden i DOM'en. Produktsiden har
             # stadig enhedsprisen, så vi bruger den som sikker fallback.
             detail_meta = None
-            if not qty or unit_value is None:
+            if enrich_details and (not qty or unit_value is None):
                 detail_meta = tilbudsugen_detail_meta(single_url)
                 if unit_value is None and detail_meta.get("unit_value") is not None:
                     unit_value = detail_meta.get("unit_value")
@@ -3130,20 +3130,43 @@ with tabs[2]:
             st.session_state["offer_search_mode"] = "vare"
 
     if organic_clicked:
-        with st.spinner("Henter økologiske tilbud fra Tilbudsugen…"):
+        with st.spinner("Scanner butikkernes aktuelle tilbud og finder de økologiske…"):
+            # Tilbudsugens søgning på ordet "økologisk" er ikke komplet.
+            # Derfor henter vi i stedet hver butiks tilbudssider og filtrerer
+            # produkterne lokalt med vores øko-genkendelse.
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            def scan_one_store(store_name):
+                part = search_tilbudsugen(
+                    store_name,
+                    max_pages=30,
+                    max_results=1000,
+                    enrich_details=False,
+                )
+                if part is None or part.empty:
+                    return pd.DataFrame()
+                part = part[part["Butik"] == store_name].copy()
+                if "Øko" in part.columns:
+                    part = part[part["Øko"] == True].copy()
+                return part
+
             organic_frames = []
-            for organic_query in ("øko", "økologisk"):
-                part = search_tilbudsugen(organic_query, max_pages=8, max_results=300)
-                if part is not None and not part.empty:
-                    organic_frames.append(part)
+            with ThreadPoolExecutor(max_workers=6) as pool:
+                futures = {pool.submit(scan_one_store, store): store for store in OFFER_STORES}
+                for future in as_completed(futures):
+                    try:
+                        part = future.result()
+                        if part is not None and not part.empty:
+                            organic_frames.append(part)
+                    except Exception:
+                        pass
 
             if organic_frames:
                 raw_offer_data = pd.concat(organic_frames, ignore_index=True)
-                if "Øko" in raw_offer_data.columns:
-                    raw_offer_data = raw_offer_data[raw_offer_data["Øko"] == True].copy()
                 dedupe_cols = [c for c in ["Butik", "Vare", "Pris", "Gyldig"] if c in raw_offer_data.columns]
                 if dedupe_cols:
                     raw_offer_data = raw_offer_data.drop_duplicates(subset=dedupe_cols).reset_index(drop=True)
+                raw_offer_data = raw_offer_data.sort_values(["Butik", "Pris"], kind="stable").reset_index(drop=True)
             else:
                 raw_offer_data = pd.DataFrame()
 
@@ -3162,7 +3185,7 @@ with tabs[2]:
         organic_mode = st.session_state.get("offer_search_mode") == "organic"
         only_organic = st.toggle("Vis kun økologisk", value=organic_mode, key="only_org_tu")
         if organic_mode:
-            st.caption("🌱 Viser samlet økologiske tilbud fundet på tværs af butikker.")
+            st.caption("🌱 Viser økologiske tilbud fundet ved at scanne hver butik – mere komplet, men lidt langsommere.")
         hide_member = st.toggle("Skjul medlems-/app-tilbud", value=True, key="hide_member_tu")
         shown = shown[shown["Butik"].isin(stores)].copy()
         if only_organic:
