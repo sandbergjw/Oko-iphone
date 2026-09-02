@@ -18,8 +18,8 @@ try:
 except Exception:
     create_client = None
 
-APP_VERSION = "2.4.6"
-APP_VERSION_TEXT = "stram produktmatch + skelnen mellem bon og prisobservation"
+APP_VERSION = "2.4.7"
+APP_VERSION_TEXT = "Aviser · ingen gamle søgeresultater + stram relevans"
 
 st.set_page_config(page_title="Øko-robot", page_icon="🥬", layout="centered")
 st.title("🥬 Øko-robot")
@@ -3078,13 +3078,44 @@ with tabs[2]:
     st.subheader("Søg i ugens tilbud")
     st.caption("Tilbudsugen læses som strukturerede produktkort. Vi scanner ikke længere tilbudsaviser med OCR.")
     offer_query = st.text_input("Søg efter en vare", placeholder="Fx æg, smør eller bananer", key="tu_offer_query")
-    if st.button("🔎 Søg aktuelle tilbud", type="primary", disabled=not offer_query.strip()):
+
+    # Et gammelt søgeresultat må aldrig blive stående under en ny søgetekst.
+    last_offer_query = str(st.session_state.get("offer_search_query", "") or "").strip()
+    current_offer_query = str(offer_query or "").strip()
+    if current_offer_query and normalize(current_offer_query) != normalize(last_offer_query):
+        st.session_state["offer_search_data"] = pd.DataFrame()
+
+    if st.button("🔎 Søg aktuelle tilbud", type="primary", disabled=not current_offer_query):
         with st.spinner("Søger Tilbudsugen…"):
-            st.session_state["offer_search_data"] = search_tilbudsugen(offer_query, max_pages=3, max_results=100)
+            raw_offer_data = search_tilbudsugen(current_offer_query, max_pages=3, max_results=100)
+
+            # Ekstra sikkerhedsnet: Aviser-fanen må kun vise produkter, der faktisk
+            # matcher den søgte vare. Fx må en søgning på "æg" aldrig vise bananer.
+            if raw_offer_data is not None and not raw_offer_data.empty:
+                q_family = product_family(current_offer_query, rules=load_habit_rules())
+                keep_rows = []
+                for ridx, rr in raw_offer_data.iterrows():
+                    pname = str(rr.get("Vare", "") or "")
+                    p_family = product_family(pname, rules=load_habit_rules())
+                    ok, _ = safe_wishlist_product_match(
+                        current_offer_query,
+                        pname,
+                        query_family=q_family,
+                        product_family_name=p_family,
+                    )
+                    if ok:
+                        keep_rows.append(ridx)
+                raw_offer_data = raw_offer_data.loc[keep_rows].copy() if keep_rows else pd.DataFrame(columns=raw_offer_data.columns)
+
+            st.session_state["offer_search_data"] = raw_offer_data
+            st.session_state["offer_search_query"] = current_offer_query
 
     shown = st.session_state.get("offer_search_data", pd.DataFrame())
     if shown is None or shown.empty:
-        st.info("Skriv en vare og tryk ‘Søg aktuelle tilbud’.")
+        if current_offer_query and normalize(current_offer_query) != normalize(str(st.session_state.get("offer_search_query", "") or "")):
+            st.info("Tryk ‘Søg aktuelle tilbud’ for at søge på den nye vare.")
+        else:
+            st.info("Ingen aktuelle tilbud fundet med denne søgning og de valgte filtre.")
     else:
         stores = st.multiselect("Butikker", OFFER_STORES, default=OFFER_STORES, key="tu_stores")
         only_organic = st.toggle("Vis kun økologisk", value=False, key="only_org_tu")
