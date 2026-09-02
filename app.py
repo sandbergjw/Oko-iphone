@@ -18,8 +18,8 @@ try:
 except Exception:
     create_client = None
 
-APP_VERSION = "2.3.0"
-APP_VERSION_TEXT = "Tilbudsugen · 9 fysiske butikker + Nemlig"
+APP_VERSION = "2.3.1"
+APP_VERSION_TEXT = "Tilbudsugen · grundvare-søgning + øko-filter"
 
 st.set_page_config(page_title="Øko-robot", page_icon="🥬", layout="centered")
 st.title("🥬 Øko-robot")
@@ -1348,10 +1348,18 @@ def tilbudsugen_detail_is_member(url):
         return False
 
 
+def tilbudsugen_search_term(query):
+    """Søg på grundvaren; fx 'Æg øko' -> 'Æg'. Øko filtreres bagefter."""
+    q = str(query or "").strip()
+    q = re.sub(r"(?i)\b(økologiske|økologisk|økologi|øko|øgo)\b", " ", q)
+    q = re.sub(r"\s+", " ", q).strip(" -_,.")
+    return q or str(query or "").strip()
+
+
 @st.cache_data(ttl=1200, show_spinner=False)
 def search_tilbudsugen(query, max_pages=3, max_results=80):
     """Søg aktuelle tilbud på Tilbudsugen og læs deres strukturerede produktkort – ingen OCR."""
-    query = str(query or "").strip()
+    query = tilbudsugen_search_term(query)
     if not query:
         return pd.DataFrame()
 
