@@ -18,8 +18,8 @@ try:
 except Exception:
     create_client = None
 
-APP_VERSION = "2.3.1"
-APP_VERSION_TEXT = "Tilbudsugen · grundvare-søgning + øko-filter"
+APP_VERSION = "2.3.2"
+APP_VERSION_TEXT = "Tilbudsugen · tom dataramme-fix + øko-filter"
 
 st.set_page_config(page_title="Øko-robot", page_icon="🥬", layout="centered")
 st.title("🥬 Øko-robot")
@@ -1881,7 +1881,15 @@ def current_vs_history(current_row, hist):
     return False
 
 def wishlist_match(data, items, organic_only=True, include_nemlig=True, include_member_deals=False):
-    base = data.copy()
+    # Gør funktionen robust, også hvis session_state stadig indeholder en tom/ældre DataFrame.
+    required_cols = ["Butik", "Vare", "Beskrivelse", "Pris", "Øko", "Avis", "Side", "Kilde", "Type"]
+    if not isinstance(data, pd.DataFrame):
+        base = pd.DataFrame(columns=required_cols)
+    else:
+        base = data.copy()
+        for col in required_cols:
+            if col not in base.columns:
+                base[col] = False if col == "Øko" else None
 
     if not include_nemlig and not base.empty and "Butik" in base.columns:
         base = base[
@@ -2630,7 +2638,9 @@ def price_verdict(query, price):
 
 
 if "flyer_data" not in st.session_state:
-    st.session_state["flyer_data"] = pd.DataFrame()
+    st.session_state["flyer_data"] = pd.DataFrame(columns=[
+        "Butik", "Vare", "Beskrivelse", "Pris", "Øko", "Avis", "Side", "Kilde", "Type"
+    ])
 if "source_status" not in st.session_state:
     st.session_state["source_status"] = []
 if "offer_search_data" not in st.session_state:
@@ -2728,7 +2738,11 @@ with tabs[1]:
     include_member_w = st.toggle("Medtag medlems-/app-tilbud", value=False, key="member_w", help="Slå kun til hvis du også vil se tilbud, der kræver medlemskab eller app.")
 
     if st.button("Find bedste pris", type="primary", disabled=not wanted_items):
-        data = st.session_state["flyer_data"]
+        data = st.session_state.get("flyer_data")
+        if not isinstance(data, pd.DataFrame):
+            data = pd.DataFrame(columns=[
+                "Butik", "Vare", "Beskrivelse", "Pris", "Øko", "Avis", "Side", "Kilde", "Type"
+            ])
         with st.spinner("Søger aktuelle tilbud hos Tilbudsugen og Nemlig…"):
             result = wishlist_match(
                 data,
