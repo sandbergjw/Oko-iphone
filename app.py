@@ -18,8 +18,8 @@ try:
 except Exception:
     create_client = None
 
-APP_VERSION = "2.4.2"
-APP_VERSION_TEXT = "Tilbudsugen · korrekt mængde, enhedspris og rangering"
+APP_VERSION = "2.4.3"
+APP_VERSION_TEXT = "Tilbudsugen · korrekt stk.-pris og mængde fra detaljeside"
 
 st.set_page_config(page_title="Øko-robot", page_icon="🥬", layout="centered")
 st.title("🥬 Øko-robot")
@@ -1274,7 +1274,11 @@ def parse_offer_money(text):
 
 def parse_tilbudsugen_unit_price(text):
     t = str(text or "").lower().replace("pr.", "/").replace("per", "/")
-    m = re.search(r"(\d{1,4}(?:[.,]\d{1,2})?)\s*,-?\s*/\s*(kg|ltr|l|stk)\b", t)
+    # Tilbudsugen bruger fx "2,75,- / stk." og "3,- / stk."
+    m = re.search(
+        r"(\d{1,4}(?:[.,]\d{1,2})?)\s*(?:,-)?\s*/\s*(kg|ltr|liter|l|stk)\b",
+        t
+    )
     if not m:
         return None, None
     value = float(m.group(1).replace(",", "."))
@@ -1350,6 +1354,42 @@ def tilbudsugen_detail_is_member(url):
         return any(t in txt for t in terms)
     except Exception:
         return False
+
+
+@st.cache_data(ttl=1200, show_spinner=False)
+def tilbudsugen_detail_meta(url):
+    """Læs sikre metadata fra Tilbudsugens produktside.
+    Bruges især når listekortet ikke giver mængde/enhedspris korrekt.
+    """
+    meta = {
+        "member": False,
+        "unit_value": None,
+        "unit_name": None,
+        "unit_text": "",
+    }
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        lines = _clean_card_lines(soup)
+        joined = " ".join(lines).lower()
+
+        terms = (
+            "app-medlemspris", "app medlemspris", "medlemspris", "medlems-pris",
+            "kundeklub", "club pris", "pluspris", "plus pris", "app-pris", "app pris",
+        )
+        meta["member"] = any(t in joined for t in terms)
+
+        for line in lines:
+            uv, un = parse_tilbudsugen_unit_price(line)
+            if uv is not None:
+                meta["unit_value"] = uv
+                meta["unit_name"] = un
+                meta["unit_text"] = line
+                break
+    except Exception:
+        pass
+    return meta
 
 
 def tilbudsugen_search_term(query):
@@ -1443,8 +1483,18 @@ def search_tilbudsugen(query, max_pages=3, max_results=80):
                     unit_value, unit_name, unit_text = uv, un, line
                     break
 
-            # Tilbudsugen viser normalt både mængde og enhedspris. Hvis HTML-kortet
-            # kun gav os den ene, udleder vi den anden sikkert ud fra prisforholdet.
+            # Nogle Tilbudsugen-kort skjuler mængden i DOM'en. Produktsiden har
+            # stadig enhedsprisen, så vi bruger den som sikker fallback.
+            detail_meta = None
+            if not qty or unit_value is None:
+                detail_meta = tilbudsugen_detail_meta(single_url)
+                if unit_value is None and detail_meta.get("unit_value") is not None:
+                    unit_value = detail_meta.get("unit_value")
+                    unit_name = detail_meta.get("unit_name")
+                    unit_text = detail_meta.get("unit_text") or ""
+
+            # Hvis vi har pris + enhedspris, kan vi udlede den faktiske mængde.
+            # Fx 22 / 2,75 = 8 stk. og 30 / 3,00 = 10 stk.
             if not qty and unit_value is not None and unit_name in ("stk", "kg", "l") and unit_value > 0:
                 inferred_amount = float(price) / float(unit_value)
                 if unit_name == "stk" and abs(inferred_amount - round(inferred_amount)) < 0.08:
@@ -1463,6 +1513,8 @@ def search_tilbudsugen(query, max_pages=3, max_results=80):
             member_hint = any(t in card_text.lower() for t in (
                 "app-medlemspris", "medlemspris", "kundeklub", "pluspris", "app-pris"
             ))
+            if detail_meta is not None and detail_meta.get("member"):
+                member_hint = True
             # Øko må kun komme fra selve varenavnet. Et for stort HTML-kort kan
             # ellers indeholde tekst fra nabotilbud og fejlagtigt gøre fx skrabeæg økologiske.
             organic = looks_organic(product)
