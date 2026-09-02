@@ -18,8 +18,8 @@ try:
 except Exception:
     create_client = None
 
-APP_VERSION = "2.3.2"
-APP_VERSION_TEXT = "Tilbudsugen · tom dataramme-fix + øko-filter"
+APP_VERSION = "2.3.3"
+APP_VERSION_TEXT = "Tilbudsugen · korrekt pris/dato + stramt øko-filter"
 
 st.set_page_config(page_title="Øko-robot", page_icon="🥬", layout="centered")
 st.title("🥬 Øko-robot")
@@ -1257,8 +1257,12 @@ def canonical_offer_store(text):
 
 
 def parse_offer_money(text):
-    """Danske tilbudspriser: 22,- / 12,99,- / 12,99 kr."""
+    """Danske tilbudspriser: 22,- / 12,99,- / 12,99 kr.
+    Datoer som 28.08 og 28.08 - 03.09 må aldrig tolkes som priser.
+    """
     t = str(text or "").strip().replace(" ", " ")
+    if re.fullmatch(r"\d{2}\.\d{2}(?:\s*-\s*\d{2}\.\d{2})?", t):
+        return None
     m = re.search(r"(?<!\d)(\d{1,4})[.,](\d{2})\s*(?:,-|kr\.?|$)", t, re.I)
     if m:
         return float(f"{m.group(1)}.{m.group(2)}")
@@ -1414,6 +1418,8 @@ def search_tilbudsugen(query, max_pages=3, max_results=80):
 
             price = None
             for line in lines:
+                if re.fullmatch(r"\d{2}\.\d{2}\s*-\s*\d{2}\.\d{2}", line):
+                    continue
                 if "/" in line and re.search(r"\b(kg|ltr|l|stk)\b", line.lower()):
                     continue
                 p = parse_offer_money(line)
@@ -1435,7 +1441,9 @@ def search_tilbudsugen(query, max_pages=3, max_results=80):
             member_hint = any(t in card_text.lower() for t in (
                 "app-medlemspris", "medlemspris", "kundeklub", "pluspris", "app-pris"
             ))
-            organic = looks_organic(product) or looks_organic(card_text)
+            # Øko må kun komme fra selve varenavnet. Et for stort HTML-kort kan
+            # ellers indeholde tekst fra nabotilbud og fejlagtigt gøre fx skrabeæg økologiske.
+            organic = looks_organic(product)
             seen.add(single_url)
             rows.append({
                 "Butik": store,
