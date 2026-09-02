@@ -10,7 +10,7 @@ import pandas as pd
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin
+from urllib.parse import urljoin, quote
 from PIL import Image
 
 try:
@@ -18,8 +18,8 @@ try:
 except Exception:
     create_client = None
 
-APP_VERSION = "2.2.2"
-APP_VERSION_TEXT = "Vaner-key fix v2"
+APP_VERSION = "2.3.0"
+APP_VERSION_TEXT = "Tilbudsugen · 9 fysiske butikker + Nemlig"
 
 st.set_page_config(page_title="Øko-robot", page_icon="🥬", layout="centered")
 st.title("🥬 Øko-robot")
@@ -48,6 +48,27 @@ SECONDARY_FLYER_SOURCES = {
 # Nemlig har ikke en klassisk ugeavis på samme måde som de fysiske kæder.
 ONLINE_ONLY = {
     "Nemlig.com": "https://www.nemlig.com/tilbud",
+}
+
+# v2.3: Tilbudsugen er primær kilde til aktuelle tilbud fra fysiske butikker.
+# Nemlig.com fortsætter via sin egen direkte katalogintegration.
+TILBUDSUGEN_BASE = "https://www.tilbudsugen.dk"
+OFFER_STORES = [
+    "Netto", "REMA 1000", "365discount", "Lidl", "føtex",
+    "Bilka", "MENY", "Kvickly", "SuperBrugsen",
+]
+RECEIPT_STORES = ["Netto", "REMA 1000", "365discount", "Lidl", "føtex", "Nemlig.com"]
+
+STORE_ALIASES = {
+    "netto": "Netto",
+    "rema 1000": "REMA 1000", "rema1000": "REMA 1000", "rema": "REMA 1000",
+    "365discount": "365discount", "365 discount": "365discount", "365": "365discount",
+    "lidl": "Lidl",
+    "føtex": "føtex", "foetex": "føtex",
+    "bilka": "Bilka",
+    "meny": "MENY",
+    "kvickly": "Kvickly",
+    "superbrugsen": "SuperBrugsen", "super brugsen": "SuperBrugsen",
 }
 NEMLIG_CATALOG_PAGES = [
     "https://www.nemlig.com/dagligvarer/nye-varer-inspiration/oekologi",
@@ -1223,39 +1244,229 @@ def scrape_nemlig_online():
     return df.reset_index(drop=True)
 
 
-def fetch_all(include_nemlig=True):
-    frames = []
-    status = []
 
-    for store, url in FLYER_SOURCES.items():
-        try:
-            df = scrape_flyer_table(store, url)
-            organic_count = int(df["Øko"].sum()) if (not df.empty and "Øko" in df.columns) else 0
-            status.append((store, len(df), f"Struktureret avisdata · {organic_count} øko"))
-            if not df.empty:
-                frames.append(df)
-        except Exception:
-            status.append((store, 0, "Kunne ikke læse struktureret avisdata"))
+def canonical_offer_store(text):
+    raw = re.sub(r"\s+", " ", str(text or "")).strip().lower()
+    raw = raw.replace("ø", "ø")
+    if raw in STORE_ALIASES:
+        return STORE_ALIASES[raw]
+    for alias, canon in STORE_ALIASES.items():
+        if re.search(rf"(^|\b){re.escape(alias)}(\b|$)", raw):
+            return canon
+    return None
 
+
+def parse_offer_money(text):
+    """Danske tilbudspriser: 22,- / 12,99,- / 12,99 kr."""
+    t = str(text or "").strip().replace(" ", " ")
+    m = re.search(r"(?<!\d)(\d{1,4})[.,](\d{2})\s*(?:,-|kr\.?|$)", t, re.I)
+    if m:
+        return float(f"{m.group(1)}.{m.group(2)}")
+    m = re.search(r"(?<!\d)(\d{1,4})\s*(?:,-|kr\.?)", t, re.I)
+    if m:
+        return float(m.group(1))
+    return None
+
+
+def parse_tilbudsugen_unit_price(text):
+    t = str(text or "").lower().replace("pr.", "/").replace("per", "/")
+    m = re.search(r"(\d{1,4}(?:[.,]\d{1,2})?)\s*,-?\s*/\s*(kg|ltr|l|stk)\b", t)
+    if not m:
+        return None, None
+    value = float(m.group(1).replace(",", "."))
+    unit = m.group(2)
+    if unit in ("ltr", "l"):
+        unit = "l"
+    return value, unit
+
+
+def _clean_card_lines(node):
+    lines = []
+    for x in node.get_text("\n", strip=True).splitlines():
+        x = re.sub(r"\s+", " ", x).strip()
+        if x and x not in lines:
+            lines.append(x)
+    return lines
+
+
+def _store_from_node(node):
+    # Butikslogoets alt-tekst er den mest stabile markør på Tilbudsugen.
+    for img in node.find_all("img"):
+        alt = str(img.get("alt") or "").strip()
+        store = canonical_offer_store(alt)
+        if store:
+            return store
+    for line in _clean_card_lines(node):
+        store = canonical_offer_store(line)
+        if store and normalize(line) in {normalize(x) for x in STORE_ALIASES}:
+            return store
+    return None
+
+
+def _product_from_card(node, store):
+    lines = _clean_card_lines(node)
+    bad_exact = {
+        "se produkt", "se avis", "besøg site", "gå til lidl", "gå til 365",
+        "tilføj til indkøbsliste", "overvåg produkt", "annonce",
+    }
+    for line in lines:
+        low = line.lower().strip()
+        if canonical_offer_store(line) == store and normalize(line) in {normalize(store), normalize(store.replace(" ", ""))}:
+            continue
+        if low in bad_exact or low.startswith("se produkt") or low.startswith("se avis") or low.startswith("besøg site"):
+            continue
+        if re.fullmatch(r"\d{2}\.\d{2}\s*-\s*\d{2}\.\d{2}", line):
+            continue
+        if re.search(r"\b(?:stk|kg|g|ltr|liter|l|ml|cl)\b", low) and (" af " in low or re.match(r"^\d", low)):
+            continue
+        if parse_offer_money(line) is not None:
+            continue
+        if len(line) >= 3 and any(ch.isalpha() for ch in line):
+            return line
+
+    # Fallback: et ikke-butiksbillede har ofte varenavnet som alt-tekst.
+    for img in node.find_all("img"):
+        alt = re.sub(r"\s+", " ", str(img.get("alt") or "")).strip()
+        if alt and canonical_offer_store(alt) != store and len(alt) >= 3:
+            return alt
+    return ""
+
+
+@st.cache_data(ttl=1200, show_spinner=False)
+def tilbudsugen_detail_is_member(url):
+    """Tjek kun produktdetaljen når det er nødvendigt; medlems/app-priser er fra som standard."""
     try:
-        d365 = scrape_365_flyer()
-        status.append(("365discount", len(d365), "Tilbudsavis"))
-        if not d365.empty:
-            frames.append(d365)
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        r.raise_for_status()
+        txt = BeautifulSoup(r.text, "html.parser").get_text(" ", strip=True).lower()
+        terms = (
+            "app-medlemspris", "app medlemspris", "medlemspris", "medlems-pris",
+            "kundeklub", "club pris", "pluspris", "plus pris", "app-pris", "app pris",
+        )
+        return any(t in txt for t in terms)
     except Exception:
-        status.append(("365discount", 0, "Kunne ikke læse avis"))
+        return False
 
+
+@st.cache_data(ttl=1200, show_spinner=False)
+def search_tilbudsugen(query, max_pages=3, max_results=80):
+    """Søg aktuelle tilbud på Tilbudsugen og læs deres strukturerede produktkort – ingen OCR."""
+    query = str(query or "").strip()
+    if not query:
+        return pd.DataFrame()
+
+    rows, seen = [], set()
+    for page in range(1, int(max_pages) + 1):
+        url = f"{TILBUDSUGEN_BASE}/offer/{quote(query, safe='')}?page={page}"
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=20)
+            r.raise_for_status()
+        except Exception:
+            break
+        soup = BeautifulSoup(r.text, "html.parser")
+        links = soup.find_all("a", href=re.compile(r"/single/\d+"))
+        if not links:
+            break
+
+        page_added = 0
+        for a in links:
+            href = str(a.get("href") or "")
+            single_url = urljoin(TILBUDSUGEN_BASE, href)
+            if single_url in seen:
+                continue
+
+            # Find den mindste forælder der både indeholder butik, dato og pris.
+            card = None
+            node = a
+            for _ in range(8):
+                node = node.parent
+                if node is None:
+                    break
+                txt = node.get_text(" ", strip=True)
+                if (
+                    _store_from_node(node)
+                    and re.search(r"\b\d{2}\.\d{2}\s*-\s*\d{2}\.\d{2}\b", txt)
+                    and parse_offer_money(txt) is not None
+                ):
+                    card = node
+                    break
+            if card is None:
+                continue
+
+            store = _store_from_node(card)
+            if store not in OFFER_STORES:
+                continue
+            lines = _clean_card_lines(card)
+            product = _product_from_card(card, store)
+            if not product or normalize(product) in {"se produkt", "se avis"}:
+                continue
+
+            valid = next((x for x in lines if re.fullmatch(r"\d{2}\.\d{2}\s*-\s*\d{2}\.\d{2}", x)), "")
+            qty = next((x for x in lines if " af " in x.lower() and re.search(r"\b(stk|kg|g|ltr|l|ml|cl)\b", x.lower())), "")
+
+            price = None
+            for line in lines:
+                if "/" in line and re.search(r"\b(kg|ltr|l|stk)\b", line.lower()):
+                    continue
+                p = parse_offer_money(line)
+                if p is not None:
+                    price = p
+                    break
+            if price is None or price <= 0:
+                continue
+
+            unit_value, unit_name = None, None
+            unit_text = ""
+            for line in lines:
+                uv, un = parse_tilbudsugen_unit_price(line)
+                if uv is not None:
+                    unit_value, unit_name, unit_text = uv, un, line
+                    break
+
+            card_text = " ".join(lines)
+            member_hint = any(t in card_text.lower() for t in (
+                "app-medlemspris", "medlemspris", "kundeklub", "pluspris", "app-pris"
+            ))
+            organic = looks_organic(product) or looks_organic(card_text)
+            seen.add(single_url)
+            rows.append({
+                "Butik": store,
+                "Vare": product,
+                "Beskrivelse": qty,
+                "Pris": float(price),
+                "Øko": organic,
+                "Avis": valid,
+                "Side": "",
+                "Kilde": single_url,
+                "Type": "Tilbudsugen · aktuelt tilbud",
+                "Mængde": qty,
+                "Gyldig": valid,
+                "UnitPrice": unit_value,
+                "UnitName": unit_name,
+                "Enhedspris_kilde": unit_text,
+                "Medlemspris": bool(member_hint),
+            })
+            page_added += 1
+            if len(rows) >= int(max_results):
+                break
+        if len(rows) >= int(max_results) or page_added == 0:
+            break
+
+    if not rows:
+        return pd.DataFrame(columns=[
+            "Butik", "Vare", "Beskrivelse", "Pris", "Øko", "Avis", "Side", "Kilde", "Type",
+            "Mængde", "Gyldig", "UnitPrice", "UnitName", "Enhedspris_kilde", "Medlemspris",
+        ])
+    return pd.DataFrame(rows).drop_duplicates(subset=["Butik", "Vare", "Pris", "Gyldig"]).reset_index(drop=True)
+
+def fetch_all(include_nemlig=True):
+    """v2.3: Hele aviser crawles ikke længere. Tilbudsugen søges direkte pr. vare."""
+    status = [(store, 0, "Tilbudsugen · direkte varesøgning") for store in OFFER_STORES]
     if include_nemlig:
         status.append(("Nemlig.com", 0, "Direkte produktsøgning ved behov"))
-
-    data = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
-        columns=["Butik", "Vare", "Beskrivelse", "Pris", "Øko", "Avis", "Side", "Kilde", "Type"]
-    )
-    # Gem det robotten så i dag. Fejl i prishukommelsen må aldrig blokere avis-læsningen.
-    try:
-        save_offer_snapshots(data)
-    except Exception:
-        pass
+    data = pd.DataFrame(columns=[
+        "Butik", "Vare", "Beskrivelse", "Pris", "Øko", "Avis", "Side", "Kilde", "Type"
+    ])
     return data, status
 
 
@@ -1598,6 +1809,14 @@ def save_nemlig_search_prices(df):
 
 
 def candidate_unit_info(row):
+    # Tilbudsugen leverer ofte allerede enhedsprisen; brug den før egen beregning.
+    try:
+        uv = row.get("UnitPrice")
+        un = row.get("UnitName")
+        if uv is not None and not pd.isna(uv) and str(un or "") in ("kg", "l", "stk"):
+            return float(uv), str(un)
+    except Exception:
+        pass
     try:
         price = float(row.get("Pris"))
     except Exception:
@@ -1653,7 +1872,7 @@ def current_vs_history(current_row, hist):
             return False
     return False
 
-def wishlist_match(data, items, organic_only=True, include_nemlig=True):
+def wishlist_match(data, items, organic_only=True, include_nemlig=True, include_member_deals=False):
     base = data.copy()
 
     if not include_nemlig and not base.empty and "Butik" in base.columns:
@@ -1668,6 +1887,34 @@ def wishlist_match(data, items, organic_only=True, include_nemlig=True):
     for item in items:
         candidates = []
         query_family = product_family(item, rules=load_habit_rules())
+
+        # Primær aktuelle tilbudskilde: søg varen direkte hos Tilbudsugen.
+        try:
+            tu_df = search_tilbudsugen(item, max_pages=3, max_results=80)
+            if organic_only and not tu_df.empty:
+                tu_df = tu_df[tu_df["Øko"] == True]
+            if not tu_df.empty:
+                try:
+                    save_offer_snapshots(tu_df)
+                except Exception:
+                    pass
+                for _, tr in tu_df.iterrows():
+                    product_name = str(tr["Vare"])
+                    product_family_name = product_family(product_name, rules=load_habit_rules())
+                    ok, score = safe_wishlist_product_match(
+                        item, product_name, query_family, product_family_name
+                    )
+                    if not ok:
+                        continue
+                    if not include_member_deals:
+                        is_member = bool(tr.get("Medlemspris", False))
+                        if not is_member and str(tr.get("Kilde", "")).startswith("http"):
+                            is_member = tilbudsugen_detail_is_member(str(tr.get("Kilde")))
+                        if is_member:
+                            continue
+                    candidates.append((score, tr))
+        except Exception:
+            pass
         for _, r in base.iterrows():
             product_name = str(r["Vare"])
             product_family_name = product_family(product_name, rules=load_habit_rules())
@@ -2189,7 +2436,7 @@ def save_purchase_history(df, store):
     client = supabase_client()
     if not client:
         raise RuntimeError("Supabase er ikke forbundet.")
-    valid_stores = {"Netto", "REMA 1000", "365discount", "Lidl", "føtex", "Nemlig.com"}
+    valid_stores = set(RECEIPT_STORES)
     if store not in valid_stores:
         raise ValueError("Vælg bonens butik før du gemmer. 'Ukendt' gemmes ikke længere.")
     payload = []
@@ -2378,6 +2625,8 @@ if "flyer_data" not in st.session_state:
     st.session_state["flyer_data"] = pd.DataFrame()
 if "source_status" not in st.session_state:
     st.session_state["source_status"] = []
+if "offer_search_data" not in st.session_state:
+    st.session_state["offer_search_data"] = pd.DataFrame()
 
 def danish_sort_key(text):
     """Dansk alfabetisk rækkefølge: ... z, æ, ø, å."""
@@ -2423,23 +2672,22 @@ def canonical_shopping_items():
 tabs = st.tabs(["🏠", "📝 Jeg mangler", "📰 Aviser", "🎯 Til mig", "📸 Bon", "🧠 Vaner", "⚙️"])
 
 with tabs[0]:
-    st.success("Nu læser robotten tilbudsaviser og bygger sin egen prishukommelse")
+    st.success("Nu søger robotten strukturerede tilbud hos Tilbudsugen – uden avis-OCR")
     st.write(
-        "Netto, REMA 1000, Lidl, føtex og 365discount behandles som **tilbudsaviser**. "
-        "Nemlig.com søges **direkte i produktkataloget**, når du trykker “Find bedste pris”. "
-        "Hver gang aviserne læses, gemmes de priser robotten faktisk har set."
+        "Netto, REMA 1000, 365discount, Lidl, føtex, Bilka, MENY, Kvickly og SuperBrugsen "
+        "søges via **Tilbudsugen**. Nemlig.com søges fortsat direkte i sit eget produktkatalog. "
+        "Robotten sammenligner kun priser, den faktisk kan finde."
     )
     a, b = st.columns(2)
-    a.metric("Tilbudsaviser", 5)
+    a.metric("Fysiske butikker", 9)
     b.metric("Online butik", 1)
 
     include_nemlig = st.toggle("Tag Nemlig.com online-tilbud med", value=True)
-    if st.button("🔄 Læs ugens tilbudsaviser", type="primary"):
-        with st.spinner("Gennemgår tilbudsaviserne…"):
-            data, status = fetch_all(include_nemlig=include_nemlig)
+    if st.button("✅ Klargør tilbudskilder", type="primary"):
+        data, status = fetch_all(include_nemlig=include_nemlig)
         st.session_state["flyer_data"] = data
         st.session_state["source_status"] = status
-        st.success(f"{len(data)} avis-/tilbudsvarer fundet.")
+        st.success("Klar. Varer søges direkte, når du bruger ‘Jeg mangler’. ")
 
 with tabs[1]:
     st.subheader("Hvad mangler du?")
@@ -2469,21 +2717,18 @@ with tabs[1]:
 
     organic_only = st.toggle("Kun økologiske tilbud", value=True)
     include_nemlig_w = st.toggle("Tag Nemlig.com med", value=True, key="nemlig_w")
+    include_member_w = st.toggle("Medtag medlems-/app-tilbud", value=False, key="member_w", help="Slå kun til hvis du også vil se tilbud, der kræver medlemskab eller app.")
 
     if st.button("Find bedste pris", type="primary", disabled=not wanted_items):
         data = st.session_state["flyer_data"]
-        if data.empty:
-            with st.spinner("Læser tilbudsaviserne først…"):
-                data, status = fetch_all(include_nemlig=include_nemlig_w)
-            st.session_state["flyer_data"] = data
-            st.session_state["source_status"] = status
-
-        result = wishlist_match(
-            data,
-            wanted_items,
-            organic_only=organic_only,
-            include_nemlig=include_nemlig_w,
-        )
+        with st.spinner("Søger aktuelle tilbud hos Tilbudsugen og Nemlig…"):
+            result = wishlist_match(
+                data,
+                wanted_items,
+                organic_only=organic_only,
+                include_nemlig=include_nemlig_w,
+                include_member_deals=include_member_w,
+            )
         if not result.empty and "Du mangler" in result.columns:
             result = result.sort_values(
                 "Du mangler",
@@ -2513,103 +2758,71 @@ with tabs[1]:
             st.metric("Samlet pris for fundne varer", f"{found.sum():.2f} kr.")
 
 with tabs[2]:
-    st.subheader("Ugens tilbudsaviser")
-    st.caption("Aviserne læses nu fra den strukturerede produktliste. OCR er sat på pause, fordi den gav for mange falske varer.")
-    if st.button("Opdater aviser"):
-        with st.spinner("Læser aviser… Netto-scanningen kan tage et par minutter første gang."):
-            data, status = fetch_all(include_nemlig=True)
-        st.session_state["flyer_data"] = data
-        st.session_state["source_status"] = status
+    st.subheader("Søg i ugens tilbud")
+    st.caption("Tilbudsugen læses som strukturerede produktkort. Vi scanner ikke længere tilbudsaviser med OCR.")
+    offer_query = st.text_input("Søg efter en vare", placeholder="Fx æg, smør eller bananer", key="tu_offer_query")
+    if st.button("🔎 Søg aktuelle tilbud", type="primary", disabled=not offer_query.strip()):
+        with st.spinner("Søger Tilbudsugen…"):
+            st.session_state["offer_search_data"] = search_tilbudsugen(offer_query, max_pages=3, max_results=100)
 
-    data = st.session_state["flyer_data"]
-    if data.empty:
-        st.info("Tryk 'Opdater aviser' for at hente indhold.")
+    shown = st.session_state.get("offer_search_data", pd.DataFrame())
+    if shown is None or shown.empty:
+        st.info("Skriv en vare og tryk ‘Søg aktuelle tilbud’.")
     else:
-        stores = st.multiselect(
-            "Butikker",
-            ["Netto", "REMA 1000", "365discount", "Lidl", "føtex", "Nemlig.com"],
-            default=["Netto", "REMA 1000", "365discount", "Lidl", "føtex"],
-        )
-        only_organic = st.toggle("Vis kun økologisk", value=True, key="only_org_flyer")
-        shown = data[data["Butik"].isin(stores)].copy()
+        stores = st.multiselect("Butikker", OFFER_STORES, default=OFFER_STORES, key="tu_stores")
+        only_organic = st.toggle("Vis kun økologisk", value=False, key="only_org_tu")
+        hide_member = st.toggle("Skjul medlems-/app-tilbud", value=True, key="hide_member_tu")
+        shown = shown[shown["Butik"].isin(stores)].copy()
         if only_organic:
             shown = shown[shown["Øko"] == True]
-
+        if hide_member and "Medlemspris" in shown.columns:
+            shown = shown[shown["Medlemspris"] != True]
         if shown.empty:
-            st.info("Ingen varer fundet med de valgte filtre.")
+            st.info("Ingen tilbud fundet med de valgte filtre.")
         else:
-            shown["Vare_vis"] = shown["Vare"].fillna("").map(clean_flyer_product_name)
-            shown["_Butik_sort"] = shown["Butik"].fillna("").map(danish_sort_key)
-            shown["_Vare_sort"] = shown["Vare_vis"].fillna("").map(danish_sort_key)
-            shown = shown.sort_values(["_Butik_sort", "_Vare_sort", "Pris"], kind="stable")
-
-            st.caption(f"{len(shown)} fundne tilbud · parser v{APP_VERSION}")
-
+            shown = shown.sort_values(["Pris", "Butik"], kind="stable")
+            st.caption(f"{len(shown)} aktuelle resultater")
             for _, row in shown.iterrows():
-                store = str(row.get("Butik") or "")
-                product = str(row.get("Vare_vis") or row.get("Vare") or "").strip()
-                try:
-                    price_txt = f"{float(row.get('Pris')):.2f} kr.".replace(".00", "")
-                except Exception:
-                    price_txt = "Pris ukendt"
-
-                source_type = str(row.get("Type") or row.get("Avis") or "").strip()
-                st.markdown(f"**{product or 'Ukendt vare'}**")
-                st.write(f"{store} · **{price_txt}**")
-                page = str(row.get("Side") or "").strip()
-                meta = source_type + (f" · side {page}" if page else "")
+                st.markdown(f"**{row.get('Vare','Ukendt vare')}**")
+                st.write(f"{row.get('Butik','')} · **{float(row.get('Pris')):.2f} kr.**")
+                meta = []
+                if row.get("Mængde"):
+                    meta.append(str(row.get("Mængde")))
+                if row.get("Enhedspris_kilde"):
+                    meta.append(str(row.get("Enhedspris_kilde")))
+                if row.get("Gyldig"):
+                    meta.append(str(row.get("Gyldig")))
+                if row.get("Medlemspris"):
+                    meta.append("medlems/app-pris")
                 if meta:
-                    st.caption(meta)
+                    st.caption(" · ".join(meta))
+                st.link_button("Se tilbud", str(row.get("Kilde")), use_container_width=False)
                 st.divider()
-
-            with st.expander("🔎 Se tekniske avisdetaljer"):
-                columns = ["Butik", "Vare_vis", "Pris", "Avis", "Side", "Type", "Kilde"]
-                detail = shown[[c for c in columns if c in shown.columns]].rename(columns={"Vare_vis": "Vare"})
-                st.dataframe(
-                    detail,
-                    hide_index=True,
-                    use_container_width=True,
-                    column_config={"Kilde": st.column_config.LinkColumn("Kilde", display_text="Åbn")},
-                )
 
 with tabs[3]:
     st.subheader("Tilbud på dine faste varer")
-    h = load_habits()
-    if not h:
-        st.info("Scan nogle boner først.")
+    fixed_items = canonical_shopping_items()
+    if not fixed_items:
+        st.info("Scan nogle boner og opret kategorier først.")
     else:
-        data = st.session_state["flyer_data"]
-        if data.empty:
-            st.info("Læs tilbudsaviserne under 📰 først.")
-        else:
-            rows = []
-            organic = data[data["Øko"] == True]
-            for item, count in sorted(h.items(), key=lambda x: x[1], reverse=True):
-                candidates = []
-                for _, r in organic.iterrows():
-                    # Til mig skal matche selve varen – ikke en bred avisbeskrivelse,
-                    # som kan omtale flere helt forskellige produkter.
-                    s = match_score(item, r["Vare"], "")
-                    q_family = product_family(item, rules=load_habit_rules())
-                    p_family = product_family(r["Vare"], rules=load_habit_rules())
-                    same_family = (
-                        q_family and p_family
-                        and normalize(q_family) == normalize(p_family)
-                    )
-                    if s >= 0.55 or same_family:
-                        candidates.append((max(s, 1.0 if same_family else s), r))
-                if candidates:
-                    candidates.sort(key=lambda x: (-x[0], x[1]["Pris"]))
-                    _, r = candidates[0]
-                    rows.append([item, count, r["Butik"], r["Vare"], r["Pris"], r["Type"]])
-            if rows:
-                st.dataframe(
-                    pd.DataFrame(rows, columns=["Din vare", "Køb", "Butik", "Tilbud", "Pris", "Kilde-type"]),
-                    hide_index=True,
-                    use_container_width=True,
+        st.caption(f"Søger dine {min(len(fixed_items), 12)} første faste kategorier direkte hos Tilbudsugen.")
+        include_member_mine = st.toggle("Medtag medlems-/app-tilbud", value=False, key="member_mine")
+        if st.button("🎯 Find tilbud til mig", type="primary"):
+            with st.spinner("Søger dine faste varer…"):
+                mine = wishlist_match(
+                    pd.DataFrame(), fixed_items[:12], organic_only=True, include_nemlig=True,
+                    include_member_deals=include_member_mine,
                 )
-            else:
-                st.info("Ingen af dine faste varer matchede ugens øko-tilbud.")
+            st.session_state["mine_offer_results"] = mine
+        mine = st.session_state.get("mine_offer_results", pd.DataFrame())
+        if mine is not None and not mine.empty:
+            for _, rr in mine.iterrows():
+                st.markdown(f"**{rr.get('Du mangler','')}** · {rr.get('Vurdering','')}")
+                st.write(f"{rr.get('Butik','')} · {rr.get('Pris') if pd.notna(rr.get('Pris')) else 'Ingen sikker pris'}")
+                if rr.get("Enhedspris"):
+                    st.caption(str(rr.get("Enhedspris")))
+                st.caption(str(rr.get("Svar", "")))
+                st.divider()
 
 with tabs[4]:
     st.subheader("Scan bon")
@@ -2655,7 +2868,7 @@ with tabs[4]:
     )
     store = st.selectbox(
         "Bonens butik",
-        ["Netto", "REMA 1000", "365discount", "Lidl", "føtex", "Nemlig.com"],
+        RECEIPT_STORES,
         index=None,
         placeholder="Vælg butik",
     )
@@ -2901,16 +3114,13 @@ with tabs[6]:
             icon = "🟢" if count else "🟡"
             st.write(f"{icon} **{store}** · {count} varer · {typ}")
     else:
-        st.write("Netto · tilbudsavis")
-        st.write("REMA 1000 · tilbudsavis")
-        st.write("365discount · tilbudsavis")
-        st.write("Lidl · tilbudsavis")
-        st.write("føtex · tilbudsavis")
-        st.write("Nemlig.com · online tilbud (ingen klassisk ugeavis)")
+        for store in OFFER_STORES:
+            st.write(f"{store} · Tilbudsugen (direkte varesøgning)")
+        st.write("Nemlig.com · direkte online produktsøgning")
 
     st.divider()
     st.write("**Permanent lagring:**", "✅ Supabase" if supabase_client() else "⚠️ lokal fallback")
     st.write("**Bon-OCR:**", "✅ aktiv" if ocr_key() else "⚠️ ikke aktiveret")
-    st.caption("Netto+ og andre medlemsprogrammer er ikke datakilden. Gamle tilbud gemmes som tilbudshistorik og bruges aldrig som normalpris.")
+    st.caption("Medlems-/app-tilbud er slået fra som standard. Gamle tilbud gemmes som tilbudshistorik og bruges aldrig som normalpris.")
 
 st.caption(f"Øko-robot v{APP_VERSION} · {APP_VERSION_TEXT}")
